@@ -1,1727 +1,1662 @@
-use serde_json;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::fs::File;
-use std::io::BufReader; // For deserialisering
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
+use std::process::Command;
+use rand::prelude::*;
+use rand::seq::SliceRandom;
+use std::cmp::max;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-mod models {
-    use rand::seq::SliceRandom; // Needed for shuffle
-    use std::collections::HashMap; // Needed for patients lookup
+// =================== DATA STRUCTURES FOR INPUT PARSING ===================
 
-    #[derive(serde::Deserialize, Debug)]
-    pub struct Depot {
-        pub return_time: f64,
-        pub x_coord: f64,
-        pub y_coord: f64,
-    }
-
-    #[derive(serde::Deserialize, Debug)]
-    pub struct Patient {
-        pub x_coord: f64,
-        pub y_coord: f64,
-        pub demand: f64,
-        pub start_time: f64,
-        pub end_time: f64,
-        pub care_time: f64,
-    }
-
-    #[derive(serde::Deserialize, Debug)]
-    pub struct ProblemInstance {
-        pub instance_name: String,
-        pub nbr_nurses: usize,
-        pub capacity_nurse: f64,
-        pub benchmark: f64,
-        pub depot: Depot,
-        pub patients: HashMap<String, Patient>,
-        pub travel_times: Vec<Vec<f64>>,
-    }
-
-    // Solution representation with routes and cached flat permutation
-    #[derive(Debug, Clone)]
-    pub struct Solution {
-        pub routes: Vec<Vec<usize>>,
-        pub flat: Vec<usize>,
-    }
-
-    /// Simulerer én etappe for en rute.
-    /// Returnerer (ny finish tid, reisetid for etappen, oppdatert demand) dersom pasienten kan
-    /// legges til uten å bryte constraints.
-    pub fn simulate_leg(
-        current_duration: f64,
-        last_node: usize,
-        current_demand: f64,
-        patient_id: usize,
-        instance: &ProblemInstance,
-    ) -> Option<(f64, f64, f64)> {
-        let patient = instance.patients.get(&patient_id.to_string())?;
-        let travel_time = instance.travel_times[last_node][patient_id];
-        let arrival_time = current_duration + travel_time;
-        let start_service_time = arrival_time.max(patient.start_time);
-        let finish_time = start_service_time + patient.care_time;
-        let new_demand = current_demand + patient.demand;
-        // Ta med retur til depot (indeks 0)
-        let return_travel_time = instance.travel_times[patient_id][0];
-        let potential_total_duration = finish_time + return_travel_time;
-        if new_demand <= instance.capacity_nurse
-            && finish_time <= patient.end_time
-            && potential_total_duration <= instance.depot.return_time
-        {
-            Some((finish_time, travel_time, new_demand))
-        } else {
-            None
-        }
-    }
-
-    /// Simulerer en hel rute (uten depotoppføring) og returnerer (total reisetid, total varighet)
-    /// om gyldig.
-    pub fn simulate_route(route: &[usize], instance: &ProblemInstance) -> Option<(f64, f64)> {
-        let depot_index = 0;
-        let mut total_travel_time = 0.0;
-        let mut total_duration = 0.0;
-        let mut current_demand = 0.0;
-        let mut current_node = depot_index;
-        for &patient_id in route {
-            let (new_duration, travel, new_demand) = simulate_leg(
-                total_duration,
-                current_node,
-                current_demand,
-                patient_id,
-                instance,
-            )?;
-            total_travel_time += travel;
-            total_duration = new_duration;
-            current_demand = new_demand;
-            current_node = patient_id;
-        }
-        total_travel_time += instance.travel_times[current_node][depot_index];
-        total_duration += instance.travel_times[current_node][depot_index];
-        if total_duration > instance.depot.return_time {
-            None
-        } else {
-            Some((total_travel_time, total_duration))
-        }
-    }
-
-    /// Deler en flat permutasjon inn i ruter slik at alle constraints overholdes.
-    /// Hver pasient plasseres nøyaktig én gang.
-    pub fn split_permutation_into_routes(
-        permutation: &[usize],
-        instance: &ProblemInstance,
-    ) -> Vec<Vec<usize>> {
-        let depot_index = 0;
-        // Estimer antall ruter basert på permutasjonslengde og sykepleierkapasitet
-        let est_num_routes = (permutation.len() + instance.nbr_nurses - 1) / instance.nbr_nurses;
-        let mut routes = Vec::with_capacity(est_num_routes);
-        let mut current_route = Vec::with_capacity(permutation.len() / est_num_routes + 1);
-        let mut current_duration = 0.0;
-        let mut current_demand = 0.0;
-        let mut last_node = depot_index;
-        
-        for &patient_id in permutation {
-            if let Some((finish_time, _travel, new_demand)) = simulate_leg(
-                current_duration,
-                last_node,
-                current_demand,
-                patient_id,
-                instance,
-            ) {
-                current_route.push(patient_id);
-                current_duration = finish_time;
-                current_demand = new_demand;
-                last_node = patient_id;
-            } else {
-                routes.push(current_route);
-                // Start en ny rute med denne pasienten fra depot
-                let travel_time = instance.travel_times[depot_index][patient_id];
-                let patient = instance.patients.get(&patient_id.to_string()).unwrap();
-                let arrival_time = travel_time;
-                let start_service_time = arrival_time.max(patient.start_time);
-                let finish_time = start_service_time + patient.care_time;
-                current_route = Vec::with_capacity(permutation.len() / est_num_routes + 1);
-                current_route.push(patient_id);
-                current_duration = finish_time;
-                current_demand = patient.demand;
-                last_node = patient_id;
-            }
-        }
-        if !current_route.is_empty() {
-            routes.push(current_route);
-        }
-        routes
-    }
-
-    /// Konstruerer en gyldig løsning basert på en tilfeldig permutasjon.
-    pub fn generate_valid_solution(instance: &ProblemInstance) -> Solution {
-        let mut perm: Vec<usize> = (1..=instance.patients.len()).collect();
-        perm.shuffle(&mut rand::thread_rng());
-        let routes = split_permutation_into_routes(&perm, instance);
-        Solution { routes, flat: perm }
-    }
-
-    /// OPTIMIZATION: Time-window based solution generator
-    /// Generates a solution by ordering patients by earliest start time
-    pub fn generate_time_window_solution(instance: &ProblemInstance) -> Solution {
-        let mut patients: Vec<(usize, f64)> = 
-            (1..=instance.patients.len())
-            .map(|id| {
-                let patient = instance.patients.get(&id.to_string()).unwrap();
-                (id, patient.start_time)
-            })
-            .collect();
-        
-        // Sort by earliest start time
-        patients.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        let perm: Vec<usize> = patients.iter().map(|(id, _)| *id).collect();
-        let routes = split_permutation_into_routes(&perm, instance);
-        Solution { routes, flat: perm }
-    }
-
-    /// OPTIMIZATION: Nearest neighbor heuristic solution generator
-    pub fn generate_nearest_neighbor_solution(instance: &ProblemInstance) -> Solution {
-        let mut unvisited: Vec<usize> = (1..=instance.patients.len()).collect();
-        let mut perm = Vec::with_capacity(unvisited.len());
-        
-        // Start from depot (node 0)
-        let mut current_node = 0;
-        
-        // Build solution using nearest neighbor heuristic
-        while !unvisited.is_empty() {
-            // Find nearest unvisited patient
-            let next_index = unvisited
-                .iter()
-                .enumerate()
-                .min_by(|(_, &a), (_, &b)| {
-                    instance.travel_times[current_node][a]
-                        .partial_cmp(&instance.travel_times[current_node][b])
-                        .unwrap()
-                })
-                .map(|(index, _)| index)
-                .unwrap();
-            
-            let next_node = unvisited.remove(next_index);
-            perm.push(next_node);
-            current_node = next_node;
-        }
-        
-        let routes = split_permutation_into_routes(&perm, instance);
-        Solution { routes, flat: perm }
-    }
-
-    /// Validerer at løsningen overholder alle constraints.
-    // Optimaliser validate_solution ved å forhåndsallokere HashSet
-    pub fn validate_solution(solution: &Solution, instance: &ProblemInstance) -> bool {
-        let mut visited = std::collections::HashSet::with_capacity(instance.patients.len());
-        for route in &solution.routes {
-            if simulate_route(route, instance).is_none() {
-                return false;
-            }
-            for &p in route {
-                if !visited.insert(p) {
-                    return false;
-                }
-            }
-        }
-        visited.len() == instance.patients.len()
-    }
-
-    
-    /// OPTIMIZATION: Updates the flat representation from routes
-    pub fn update_flat_from_routes(solution: &mut Solution) {
-        solution.flat.clear();
-        for route in &solution.routes {
-            solution.flat.extend(route);
-        }
-    }
+// Represents the entire problem instance with all relevant data
+#[derive(Deserialize, Debug, Clone)]
+struct Problem {
+    instance_name: String,       // Identifier for the problem instance
+    nbr_nurses: usize,           // Number of available nurses
+    capacity_nurse: usize,       // Maximum capacity each nurse can handle (total patient demand)
+    benchmark: f64,              // Benchmark solution value for comparison
+    depot: Depot,                // Starting/ending location for all nurses
+    patients: HashMap<String, Patient>, // Map of patient IDs to their data
+    travel_times: Vec<Vec<f64>>, // Matrix of travel times between locations (index 0 is depot)
 }
 
-mod ga {
-    use crate::models::{split_permutation_into_routes, ProblemInstance, Solution};
-    use rand::seq::SliceRandom;
-    use rayon::prelude::*;
-    use std::collections::{HashMap, HashSet};
-    use rand::rngs::SmallRng;
-    use rand::{Rng, SeedableRng};
+// Represents the depot (starting and ending point for all nurses)
+#[derive(Deserialize, Debug, Clone)]
+struct Depot {
+    return_time: usize,          // Latest time nurses must return to depot
+    x_coord: usize,              // X-coordinate for visualization
+    y_coord: usize,              // Y-coordinate for visualization
+}
 
-    /// Returnerer referansen til den cachede, flate representasjonen.
-    pub fn flatten_solution(solution: &Solution) -> &Vec<usize> {
-        &solution.flat
-    }
+// Represents a patient with their location, service requirements, and time window
+#[derive(Deserialize, Debug, Clone)]
+struct Patient {
+    x_coord: usize,              // X-coordinate for visualization
+    y_coord: usize,              // Y-coordinate for visualization
+    demand: usize,               // Resource demand (counts against nurse capacity)
+    start_time: usize,           // Earliest time the visit can start
+    end_time: usize,             // Latest time the visit can start
+    care_time: usize,            // Duration of the care/service required
+}
 
-    /// Order-1 Crossover (OX1) operatør på flate permutasjoner.
-    pub fn order_one_crossover(parent1: &[usize], parent2: &[usize]) -> (Vec<usize>, Vec<usize>) {
-        let len = parent1.len();
-        let mut rng = rand::thread_rng();
-        let i = rng.gen_range(0..len);
-        let j = rng.gen_range(0..len);
-        let (start, end) = if i < j { (i, j) } else { (j, i) };
+// Solution representation: a vector of routes, each route is a vector of patient IDs
+// The outer vector has length equal to number of nurses, inner vectors contain patient IDs
+type Solution = Vec<Vec<usize>>;
 
-        let mut child1: Vec<Option<usize>> = vec![None; len];
-        let mut child2: Vec<Option<usize>> = vec![None; len];
+// Data structure for generating visualization plots
+#[derive(Serialize)]
+struct PlotData {
+    depot_x: usize,              // Depot X-coordinate
+    depot_y: usize,              // Depot Y-coordinate
+    patient_x: HashMap<String, usize>, // Map of patient IDs to X-coordinates
+    patient_y: HashMap<String, usize>, // Map of patient IDs to Y-coordinates
+    routes: Vec<Vec<usize>>,     // Solution routes for visualization
+    instance_name: String,       // Problem instance name
+}
 
-        for idx in start..=end {
-            child1[idx] = Some(parent1[idx]);
-            child2[idx] = Some(parent2[idx]);
-        }
+// =================== MAIN FUNCTION ===================
 
-        let mut pos_child1 = (end + 1) % len;
-        let mut pos_parent2 = (end + 1) % len;
-        while child1.iter().any(|gene| gene.is_none()) {
-            let gene = parent2[pos_parent2];
-            if !child1.contains(&Some(gene)) {
-                child1[pos_child1] = Some(gene);
-                pos_child1 = (pos_child1 + 1) % len;
-            }
-            pos_parent2 = (pos_parent2 + 1) % len;
-        }
-
-        let mut pos_child2 = (end + 1) % len;
-        let mut pos_parent1 = (end + 1) % len;
-        while child2.iter().any(|gene| gene.is_none()) {
-            let gene = parent1[pos_parent1];
-            if !child2.contains(&Some(gene)) {
-                child2[pos_child2] = Some(gene);
-                pos_child2 = (pos_child2 + 1) % len;
-            }
-            pos_parent1 = (pos_parent1 + 1) % len;
-        }
-
-        (
-            child1.into_iter().map(|g| g.unwrap()).collect(),
-            child2.into_iter().map(|g| g.unwrap()).collect(),
-        )
-    }
-
-    /// OPTIMIZATION: Edge Recombination Crossover
-    /// Better at preserving adjacency relationships in permutations
-    pub fn edge_recombination_crossover(parent1: &[usize], parent2: &[usize]) -> Vec<usize> {
-        let len = parent1.len();
-        let mut child = Vec::with_capacity(len);
-        
-        // Build adjacency list for each node
-        let mut edge_map: HashMap<usize, HashSet<usize>> = HashMap::new();
-        
-        // Helper function to add adjacency relationship
-        let add_adj = |map: &mut HashMap<usize, HashSet<usize>>, from: usize, to: usize| {
-            map.entry(from).or_insert_with(HashSet::new).insert(to);
-        };
-        
-        // Process parent1
-        for i in 0..len {
-            let curr = parent1[i];
-            let prev = if i == 0 { parent1[len-1] } else { parent1[i-1] };
-            let next = if i == len-1 { parent1[0] } else { parent1[i+1] };
-            
-            add_adj(&mut edge_map, curr, prev);
-            add_adj(&mut edge_map, curr, next);
-        }
-        
-        // Process parent2
-        for i in 0..len {
-            let curr = parent2[i];
-            let prev = if i == 0 { parent2[len-1] } else { parent2[i-1] };
-            let next = if i == len-1 { parent2[0] } else { parent2[i+1] };
-            
-            add_adj(&mut edge_map, curr, prev);
-            add_adj(&mut edge_map, curr, next);
-        }
-        
-        // Start with a random node from either parent
-        let mut rng = rand::thread_rng();
-        let start_from_p1 = rng.gen_bool(0.5);
-        let mut current = if start_from_p1 { parent1[0] } else { parent2[0] };
-        
-        // Build child
-        child.push(current);
-        
-        // Use a set to track remaining nodes to select from
-        let mut all_nodes: HashSet<usize> = (1..=len).collect();
-        all_nodes.remove(&current);
-        
-        while child.len() < len {
-            // Remove current node from all adjacency lists
-            for adj_list in edge_map.values_mut() {
-                adj_list.remove(&current);
-            }
-            
-            // Find next node
-            let next_node = if let Some(adj_list) = edge_map.get(&current) {
-                if !adj_list.is_empty() {
-                    // Find neighbor with fewest neighbors
-                    adj_list.iter()
-                        .filter(|&&n| !child.contains(&n)) // Only consider nodes not in child yet
-                        .min_by_key(|&&n| edge_map.get(&n).map_or(usize::MAX, |s| s.len()))
-                        .cloned()
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            
-            if let Some(next) = next_node {
-                current = next;
-                child.push(current);
-                all_nodes.remove(&current);
-            } else {
-                // If we get here, we need to select a node not yet in the child
-                if let Some(&node) = all_nodes.iter().next() {
-                    current = node;
-                    child.push(current);
-                    all_nodes.remove(&current);
-                } else {
-                    break; // Should not happen, but as a safeguard
-                }
-            }
-        }
-        
-        // Safety check - make sure we have a complete permutation
-        if child.len() < len {
-            for i in 1..=len {
-                if !child.contains(&i) {
-                    child.push(i);
-                }
-            }
-        }
-        
-        child
-    }
-
+/// Main function: parses input, runs the genetic algorithm, evaluates the solution,
+/// and outputs results including visualization.
+fn main() -> Result<(), Box<dyn Error>> {
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
     
-    /// OPTIMIZATION: Insertion Mutation
-    /// Selects and moves a random gene to a new position
-    pub fn insertion_mutation(perm: &mut Vec<usize>, mutation_rate: f64) {
-        let mut rng = rand::thread_rng();
-        if rng.gen::<f64>() < mutation_rate && perm.len() >= 2 {
-            let len = perm.len();
-            let from = rng.gen_range(0..len);
-            let to = rng.gen_range(0..len);
-            
-            // Only perform if source and destination are different
-            if from != to {
-                let value = perm.remove(from);
-                perm.insert(to, value);
-            }
-        }
-    }
-
-    // Bruk SmallRng også i mutation og crossover operasjoner
-    pub fn inversion_mutation(perm: &mut Vec<usize>, mutation_rate: f64) {
-        let mut rng = SmallRng::from_entropy();
-        if rng.gen::<f64>() < mutation_rate && perm.len() >= 2 {
-            let len = perm.len();
-            let i = rng.gen_range(0..len);
-            let j = rng.gen_range(0..len);
-            let (start, end) = if i < j { (i, j) } else { (j, i) };
-            perm[start..=end].reverse();
+    // Hardcoded problem file (would typically be passed as an argument)
+    let problem_file = "train/train_2.json";
+    
+    // Set GA parameters
+    let generations = 5000;      // Number of generations to evolve
+    let population_size = 4000;  // Size of population in each generation
+    
+    // Set random seed if provided as 5th command line argument
+    if args.len() > 4 {
+        if let Ok(seed) = args[4].parse::<u64>() {
+            let mut rng = StdRng::seed_from_u64(seed);
+            println!("Using seed: {}", seed);
         }
     }
     
-    /// OPTIMIZATION: Swap Mutation
-    /// Swaps two random positions in the permutation
-    pub fn swap_mutation(perm: &mut Vec<usize>, mutation_rate: f64) {
-        let mut rng = rand::thread_rng();
-        if rng.gen::<f64>() < mutation_rate && perm.len() >= 2 {
-            let len = perm.len();
-            let i = rng.gen_range(0..len);
-            let j = rng.gen_range(0..len);
-            
-            if i != j {
-                perm.swap(i, j);
-            }
-        }
-    }
+    println!("Running GA with {} generations and population size {}", generations, population_size);
 
-    /// OPTIMIZATION: Apply multiple mutation operators with different probabilities
-    pub fn apply_mutations(solution: &mut Solution, instance: &ProblemInstance, mutation_rate: f64) {
-        let mut rng = rand::thread_rng();
-        
-        // Choose mutation type randomly with different weights
-        let mutation_selector = rng.gen::<f64>();
-        
-        // Give route-focused mutations higher probability
-        if mutation_selector < 0.20 {  // 20% chance to attempt a route split
-            // Try the route split mutation
-            if route_split_mutation(solution, instance, mutation_rate * 1.5) {
-                return; // If split successful, we're done
-            }
-            // If split fails, fall through to other mutations
-        }
-        
-        // Standard mutations (apply to flat representation)
-        let mutation_type = rng.gen_range(0..3);
-        let perm = &mut solution.flat;
-        
-        match mutation_type {
-            0 => inversion_mutation(perm, mutation_rate),
-            1 => insertion_mutation(perm, mutation_rate),
-            _ => swap_mutation(perm, mutation_rate),
-        }
-        
-        // Update routes from flat permutation
-        solution.routes = crate::models::split_permutation_into_routes(perm, instance);
-    }
+    // Read and parse the problem from JSON file
+    let problem = read_problem(problem_file)?;
+    println!("Problem: {}", problem.instance_name);
+    println!("Nurses: {}, Capacity: {}, Patients: {}", 
+             problem.nbr_nurses, problem.capacity_nurse, problem.patients.len());
+    println!("Benchmark: {}", problem.benchmark);
 
-    /// OPTIMIZATION: Generate a diverse initial population with mixed strategies
-    pub fn generate_population(
-        population_size: usize,
-        instance: &ProblemInstance,
-    ) -> Vec<Solution> {
-        let time_window_count = population_size / 10; // 10% time-window based
-        let nearest_neighbor_count = population_size / 10; // 10% nearest-neighbor based
-        let multi_route_count = population_size / 5; // 20% solutions with more routes
-        let random_count = population_size - time_window_count - nearest_neighbor_count - multi_route_count;
+    // Create shared state for the best solution
+    let best_solution = Arc::new(Mutex::new(Vec::new())); // Initially empty
+    let best_fitness = Arc::new(Mutex::new(f64::INFINITY));
+    let running = Arc::new(AtomicBool::new(true));
+    
+    // Clone the Arc pointers for the signal handler
+    let handler_best_solution = Arc::clone(&best_solution);
+    let handler_best_fitness = Arc::clone(&best_fitness);
+    let handler_running = Arc::clone(&running);
+    let handler_problem = Arc::new(problem.clone());
+    
+    // Set up Ctrl+C handler
+    ctrlc::set_handler(move || {
+        println!("\nInterrupted by user. Finishing gracefully...");
         
-        let mut population = Vec::with_capacity(population_size);
+        // Signal the algorithm to stop
+        handler_running.store(false, Ordering::SeqCst);
         
-        // Add time-window based solutions
-        for _ in 0..time_window_count {
-            population.push(crate::models::generate_time_window_solution(instance));
-        }
+        // Get the best solution found so far
+        let solution = handler_best_solution.lock().unwrap().clone();
+        let fitness = *handler_best_fitness.lock().unwrap();
         
-        // Add nearest-neighbor based solutions
-        for _ in 0..nearest_neighbor_count {
-            population.push(crate::models::generate_nearest_neighbor_solution(instance));
-        }
-        
-        // Add solutions with intentionally more routes
-        for _ in 0..multi_route_count {
-            let mut sol = crate::models::generate_valid_solution(instance);
+        if !solution.is_empty() {
+            println!("\nBest solution found so far:");
+            println!("Travel time: {:.2}", fitness);
+            println!("Benchmark: {:.2}", handler_problem.benchmark);
+            let gap = ((fitness - handler_problem.benchmark) / handler_problem.benchmark) * 100.0;
+            println!("Gap to benchmark: {:.2}%", gap);
             
-            // Apply multiple route splits to create more routes
-            for _ in 0..5 {
-                route_split_mutation(&mut sol, instance, 0.8);
+            // Display result classification based on gap to benchmark
+            if gap <= 5.0 {
+                println!("Result: EXCELLENT (Within 5% of benchmark)");
+            } else if gap <= 10.0 {
+                println!("Result: GOOD (Within 10% of benchmark)");
+            } else if gap <= 20.0 {
+                println!("Result: ACCEPTABLE (Within 20% of benchmark)");
+            } else if gap <= 30.0 {
+                println!("Result: POOR (Within 30% of benchmark)");
+            } else {
+                println!("Result: UNACCEPTABLE (More than 30% from benchmark)");
             }
             
-            population.push(sol);
+            // Output detailed solution information
+            output_solution(&solution, &handler_problem);
+            
+            // Generate visualization of the solution
+            let plot_filename = format!("{}_interrupted_solution.png", handler_problem.instance_name);
+            if let Err(e) = generate_plot_data(&solution, &handler_problem, &plot_filename) {
+                println!("Error generating plot: {}", e);
+            } else {
+                println!("Plot generated successfully: {}", plot_filename);
+            }
         }
         
-        // Add random solutions
-        for _ in 0..random_count {
-            population.push(crate::models::generate_valid_solution(instance));
+        // Exit the program
+        std::process::exit(0);
+    }).expect("Error setting Ctrl+C handler");
+    
+    // Run the genetic algorithm with the shared state
+    let solution = genetic_algorithm(&problem, population_size, generations, &best_solution, &best_fitness, &running);
+    
+    // Evaluate the solution quality
+    let total_travel_time = evaluate_solution(&solution, &problem);
+    
+    // Print solution quality metrics
+    println!("\nSolution Quality:");
+    println!("Travel time: {:.2}", total_travel_time);
+    println!("Benchmark: {:.2}", problem.benchmark);
+    let gap = ((total_travel_time - problem.benchmark) / problem.benchmark) * 100.0;
+    println!("Gap to benchmark: {:.2}%", gap);
+    
+    // Display result classification based on gap to benchmark
+    if gap <= 5.0 {
+        println!("Result: EXCELLENT (Within 5% of benchmark)");
+    } else if gap <= 10.0 {
+        println!("Result: GOOD (Within 10% of benchmark)");
+    } else if gap <= 20.0 {
+        println!("Result: ACCEPTABLE (Within 20% of benchmark)");
+    } else if gap <= 30.0 {
+        println!("Result: POOR (Within 30% of benchmark)");
+    } else {
+        println!("Result: UNACCEPTABLE (More than 30% from benchmark)");
+    }
+    
+    // Output detailed solution information
+    output_solution(&solution, &problem);
+    
+    // Generate visualization of the solution
+    let plot_filename = format!("{}_solution.png", problem.instance_name);
+    generate_plot_data(&solution, &problem, &plot_filename)?;
+    
+    Ok(())
+}
+
+// =================== FILE I/O FUNCTIONS ===================
+
+/// Reads and parses the problem instance from a JSON file.
+/// 
+/// # Arguments
+/// * `filename` - Path to the JSON file containing problem data
+/// 
+/// # Returns
+/// * `Problem` - Parsed problem instance
+/// * Error if file cannot be read or parsed
+fn read_problem(filename: &str) -> Result<Problem, Box<dyn Error>> {
+    let file = File::open(filename)?;
+    let reader = BufReader::new(file);
+    let problem: Problem = serde_json::from_reader(reader)?;
+    Ok(problem)
+}
+
+// =================== GENETIC ALGORITHM CORE ===================
+
+/// Core genetic algorithm function that evolves a population of solutions over multiple generations.
+/// Implements several adaptive mechanisms including:
+/// - Elitism (preserving best solutions)
+/// - Tournament selection
+/// - Adaptive mutation rate that increases when improvement stagnates
+/// - Periodic local search to escape local optima
+/// 
+/// # Arguments
+/// * `problem` - The problem instance
+/// * `population_size` - Size of the population to maintain
+/// * `generations` - Number of generations to evolve
+/// 
+/// # Returns
+/// * `Solution` - The best solution found
+fn genetic_algorithm(
+    problem: &Problem, 
+    population_size: usize, 
+    generations: usize,
+    best_solution_ref: &Arc<Mutex<Solution>>,
+    best_fitness_ref: &Arc<Mutex<f64>>,
+    running: &AtomicBool
+) -> Solution {
+    // Initialize population with randomized greedy solutions
+    let mut population = initialize_population(problem, population_size);
+    
+    // Evaluate initial population
+    let mut fitness_values = evaluate_population(&population, problem);
+    
+    // Track the best solution found so far
+    let mut best_solution = find_best_solution(&population, &fitness_values).clone();
+    let mut best_fitness = evaluate_solution(&best_solution, problem);
+    
+    // Update shared state with initial best solution
+    *best_solution_ref.lock().unwrap() = best_solution.clone();
+    *best_fitness_ref.lock().unwrap() = best_fitness;
+    
+    println!("Initial best solution fitness: {:.2}", best_fitness);
+    
+    // Parameters for adaptive mutation
+    let mut mutation_rate = 0.2;  // Initial mutation probability 0.3
+    let mut generations_no_improvement = 0;
+    let max_no_improvement = 250; // After this many generations without improvement, apply local search
+    
+    // Tracking variables for summary reports
+    let mut local_search_applications = 0;
+    let mut local_search_improvements = 0;
+    let mut mutation_rate_increases = 0;
+    
+    // Main GA loop - evolve over specified number of generations
+    for generation in 0..generations {
+        // Check if we should continue or terminate gracefully
+        if !running.load(Ordering::SeqCst) {
+            println!("Genetic algorithm gracefully terminated at generation {}", generation);
+            break;
         }
         
-        population
-    }
-
-    /// Crossover-operatør: flater løsningen, bruker OX1, og "reparer" løsningen ved splitting.
-    pub fn crossover(
-        parent1: &Solution,
-        parent2: &Solution,
-        instance: &ProblemInstance,
-        crossover_type: usize,
-    ) -> Solution {
-        let perm1 = parent1.flat.clone();
-        let perm2 = parent2.flat.clone();
+        // Create new population through selection, crossover, and mutation
+        let mut new_population = Vec::with_capacity(population_size);
         
-        let child_perm = match crossover_type {
-            0 => {
-                let (child1, _) = order_one_crossover(&perm1, &perm2);
-                child1
-            },
-            _ => edge_recombination_crossover(&perm1, &perm2),
-        };
+        // Elitism: Keep the best solutions (top 10%)
+        let elite_count = (population_size as f64 * 0.1).ceil() as usize;
+        let mut indices: Vec<usize> = (0..population_size).collect();
+        indices.sort_by(|&a, &b| fitness_values[a].partial_cmp(&fitness_values[b]).unwrap());
         
-        let routes = split_permutation_into_routes(&child_perm, instance);
-        Solution {
-            routes,
-            flat: child_perm,
+        for i in 0..elite_count {
+            new_population.push(population[indices[i]].clone());
         }
-    }
-
-    /// Mutasjon-operatør: flater løsningen, muterer og reparerer.
-    pub fn mutate(solution: &Solution, mutation_rate: f64, instance: &ProblemInstance) -> Solution {
-        let mut new_solution = solution.clone();
         
-        // Apply various mutations
-        apply_mutations(&mut new_solution, instance, mutation_rate);
+        // Fill the rest with crossover and mutation
+        while new_population.len() < population_size {
+            // Select parents using tournament selection
+            let parent1_idx = tournament_selection(&fitness_values, 5);
+            let mut parent2_idx = tournament_selection(&fitness_values, 5);
+            
+            // Ensure different parents are selected when possible
+            while parent2_idx == parent1_idx && population_size > 1 {
+                parent2_idx = tournament_selection(&fitness_values, 5);
+            }
+            
+            // Perform crossover to create child solution
+            let mut child = crossover(&population[parent1_idx], &population[parent2_idx], problem);
+            
+            // Apply mutation with adaptive probability
+            if rand::thread_rng().gen::<f64>() < mutation_rate {
+                mutate(&mut child, problem);
+            }
+            
+            // Repair solution to ensure validity
+            repair_solution(&mut child, problem);
+            
+            // Add to new population
+            new_population.push(child);
+        }
         
-        new_solution
-    }
-
-    /// Calculate fitness for a solution (total travel time + penalty for extra routes)
-    pub fn fitness(solution: &Solution, instance: &ProblemInstance) -> f64 {
-        let total_travel_time: f64 = solution
-            .routes
-            .iter()
-            .filter_map(|route| crate::models::simulate_route(route, instance).map(|(t, _)| t))
-            .sum();
+        // Replace old population
+        population = new_population;
         
-        // Apply penalty for exceeding number of nurses
-        let penalty_weight = 10000.0;
-        let max_nurses = instance.nbr_nurses;
+        // Evaluate new population
+        fitness_values = evaluate_population(&population, problem);
         
-        let extra_routes = if solution.routes.len() > max_nurses {
-            solution.routes.len() - max_nurses
+        // Update best solution if improved
+        let current_best = find_best_solution(&population, &fitness_values);
+        let current_best_fitness = evaluate_solution(current_best, problem);
+        
+        if current_best_fitness < best_fitness {
+            best_solution = current_best.clone();
+            best_fitness = current_best_fitness;
+            
+            // Update the shared state with the new best solution
+            *best_solution_ref.lock().unwrap() = best_solution.clone();
+            *best_fitness_ref.lock().unwrap() = best_fitness;
+            
+            // Only print significant improvements (fitness improved by at least 0.5%)
+            println!("Generation {}: New best fitness = {:.2}", generation, best_fitness);
+            
+            generations_no_improvement = 0;
+            mutation_rate = 0.2; // Reset mutation rate when we find improvement 0.3
         } else {
-            0
-        };
-        
-        // NEW: Add a small incentive for using more routes (up to the maximum)
-        // The coefficient should be small enough not to overwhelm travel time optimization
-        let route_usage_incentive = if solution.routes.len() < max_nurses {
-            // Small negative term (improves fitness) for using more routes
-            -0.5 * (max_nurses - solution.routes.len()) as f64
-        } else {
-            0.0
-        };
-        
-        // Existing route imbalance penalty
-        let route_durations: Vec<f64> = solution
-            .routes
-            .iter()
-            .filter_map(|route| crate::models::simulate_route(route, instance).map(|(_, d)| d))
-            .collect();
+            generations_no_improvement += 1;
             
-        let imbalance_penalty = if route_durations.len() >= 2 {
-            let avg_duration = route_durations.iter().sum::<f64>() / route_durations.len() as f64;
-            let variance = route_durations.iter()
-                .map(|&d| (d - avg_duration).powi(2))
-                .sum::<f64>() / route_durations.len() as f64;
+            // Adaptively adjust mutation rate if no improvement, but don't print every time
+            if generations_no_improvement % 10 == 0 {
+                mutation_rate = (mutation_rate + 0.1).min(0.8); // Increase mutation rate but cap at 0.8
+                mutation_rate_increases += 1;
+            }
+            
+            // Apply local search if stuck, but don't print every time
+            if generations_no_improvement >= max_no_improvement {
+                local_search_applications += 1;
+                let improved_solution = local_search(&best_solution, problem);
+                let improved_fitness = evaluate_solution(&improved_solution, problem);
+                
+                if improved_fitness < best_fitness {
+                    best_solution = improved_solution;
+                    best_fitness = improved_fitness;
                     
-            // Apply small weight to avoid dominating travel time
-            variance.sqrt() * 0.1
-        } else {
-            0.0
-        };
-        
-        total_travel_time + penalty_weight * (extra_routes as f64) + imbalance_penalty + route_usage_incentive
-    }
-
-    /// Route split mutation: Tries to split a randomly selected route into two routes
-    pub fn route_split_mutation(solution: &mut Solution, instance: &ProblemInstance, mutation_rate: f64) -> bool {
-        let mut rng = rand::thread_rng();
-        
-        // Only apply with the given probability and if we have routes to split
-        if rng.gen::<f64>() >= mutation_rate || solution.routes.is_empty() {
-            return false;
-        }
-        
-        // Don't try to split if we're already at max routes
-        if solution.routes.len() >= instance.nbr_nurses {
-            return false;
-        }
-        
-        // Choose a route to split (prefer longer routes)
-        let route_weights: Vec<usize> = solution.routes.iter().map(|r| r.len()).collect();
-        let total_weight: usize = route_weights.iter().sum();
-        
-        if total_weight == 0 {
-            return false; // No routes with patients
-        }
-        
-        // Select a route with probability proportional to its length
-        let mut selected_route_idx = 0;
-        let mut cumulative = 0;
-        let threshold = rng.gen_range(0..total_weight);
-        
-        for (idx, &weight) in route_weights.iter().enumerate() {
-            cumulative += weight;
-            if cumulative > threshold {
-                selected_route_idx = idx;
-                break;
-            }
-        }
-        
-        let route = &solution.routes[selected_route_idx];
-        
-        // Don't try to split routes that are too short
-        if route.len() < 2 {
-            return false;
-        }
-        
-        // Try different split points
-        let split_point = rng.gen_range(1..route.len());
-        
-        // Create the two new routes
-        let route1 = route[0..split_point].to_vec();
-        let route2 = route[split_point..].to_vec();
-        
-        // Validate both routes
-        if crate::models::simulate_route(&route1, instance).is_some() && 
-        crate::models::simulate_route(&route2, instance).is_some() {
-            
-            // Apply the split
-            solution.routes[selected_route_idx] = route1;
-            solution.routes.push(route2);
-            
-            // Update the flat representation
-            crate::models::update_flat_from_routes(solution);
-            
-            return true;
-        }
-        
-        false // Split wasn't feasible
-    }
-
-    /// Parallellisert beregning av delt fitness med fitness sharing.
-    pub fn compute_shared_fitness(
-        population: &[Solution],
-        instance: &ProblemInstance,
-        sigma_share: f64,
-        alpha: f64,
-    ) -> Vec<(usize, f64)> {
-        population
-            .par_iter()
-            .enumerate()  // Inkluder indeksen i stedet for å klone
-            .map(|(idx, individual)| {
-                let raw_fit = fitness(individual, instance);
-                let niche_count: f64 = population
-                    .iter()
-                    .map(|other| {
-                        let flat1 = &individual.flat;
-                        let flat2 = &other.flat;
-                        let d = flat1
-                            .iter()
-                            .zip(flat2.iter())
-                            .filter(|(a, b)| a != b)
-                            .count();
-                        if (d as f64) < sigma_share {
-                            1.0 - (d as f64) / sigma_share
-                        } else {
-                            0.0
-                        }
-                    })
-                    .sum();
-                let shared_fit = raw_fit + alpha * niche_count;
-                (idx, shared_fit)  // Returner indeks i stedet for klonet løsning
-            })
-            .collect()
-    }
-
-    // Enkel turneringsseleksjon basert på delt fitness.
-    // Legg til disse importene
-
-
-    // Enum for å representere ulike seleksjonsmetoder
-    #[derive(Debug, Clone, Copy)]
-    pub enum SelectionMethod {
-        Tournament,  // Turneringsseleksjon (opprinnelig)
-        Ranked,      // Rangbasert seleksjon
-        Roulette,    // Ruletthjulseleksjon (fitness-proporsjonal)
-        Elitist      // Elitistisk seleksjon
-    }
-
-    // Den opprinnelige turneringsseleksjonen (optimalisert)
-    pub fn tournament_selection(
-        shared_pop: &[(Solution, f64)],
-        tournament_size: usize,
-    ) -> Solution {
-        let mut rng = SmallRng::from_entropy();
-        let mut best: Option<(Solution, f64)> = None;
-        
-        for _ in 0..tournament_size {
-            let candidate = shared_pop.choose(&mut rng).unwrap();
-            best = match best {
-                None => Some(candidate.clone()),
-                Some((_, best_fit)) if candidate.1 < best_fit => Some(candidate.clone()),
-                Some(b) => Some(b),
-            }
-        }
-        
-        best.unwrap().0
-    }
-
-    // Rangbasert seleksjon (gir høyere seleksjonssannsynlighet til bedre rangerte individer)
-    pub fn ranked_selection(shared_pop: &[(Solution, f64)]) -> Solution {
-        let mut rng = SmallRng::from_entropy();
-        
-        // Sorter etter fitness (lavere er bedre)
-        let mut sorted_pop = shared_pop.to_vec();
-        sorted_pop.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        // Tildel rang (1 er best)
-        let n = sorted_pop.len();
-        let selection_pressure = 1.5; // Justerbar parameter (1.0-2.0)
-        
-        // Beregn sannsynligheter basert på rang (bedre individer får høyere sannsynlighet)
-        let mut probabilities = Vec::with_capacity(n);
-        let mut cum_prob = 0.0;
-        
-        for i in 0..n {
-            let prob = (2.0 - selection_pressure) / n as f64 + 
-                    ((2.0 * (i as f64)) * (selection_pressure - 1.0)) / (n * (n - 1)) as f64;
-            
-            cum_prob += prob;
-            probabilities.push(cum_prob);
-        }
-        
-        // Velg basert på kumulativ sannsynlighet
-        let r = rng.gen::<f64>();
-        for i in 0..n {
-            if r <= probabilities[i] {
-                return sorted_pop[i].0.clone();
-            }
-        }
-        
-        // Fallback: returner det best rangerte individet
-        sorted_pop[0].0.clone()
-    }
-
-    // Ruletthjulseleksjon (fitness-proporsjonal seleksjon)
-    pub fn roulette_selection(shared_pop: &[(Solution, f64)]) -> Solution {
-        let mut rng = SmallRng::from_entropy();
-        
-        // Finn minimums- og maksimumsfitness
-        let min_fitness = shared_pop.iter()
-            .map(|(_, fit)| *fit)
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap_or(0.0);
-        
-        let max_fitness = shared_pop.iter()
-            .map(|(_, fit)| *fit)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap_or(1.0);
-        
-        // Konverter fitness til seleksjonssannsynlighet (mindre fitness = høyere sannsynlighet)
-        // Vi "inverterer" fitness-verdien siden dette er et minimeringsproblem
-        let total_inverted_fitness: f64 = shared_pop.iter()
-            .map(|(_, fit)| max_fitness + min_fitness - *fit)
-            .sum();
-        
-        if total_inverted_fitness <= 0.0 {
-            // Fallback ved 0 eller negativ total inverted fitness
-            let idx = rng.gen_range(0..shared_pop.len());
-            return shared_pop[idx].0.clone();
-        }
-        
-        // Generer tilfeldig punkt for seleksjon
-        let r = rng.gen::<f64>() * total_inverted_fitness;
-        
-        // Finn hvilket individ som ble valgt
-        let mut cum_prob = 0.0;
-        for (individual, fit) in shared_pop {
-            cum_prob += max_fitness + min_fitness - fit;
-            if cum_prob >= r {
-                return individual.clone();
-            }
-        }
-        
-        // Fallback: returner siste individ
-        shared_pop.last().unwrap().0.clone()
-    }
-
-    // Elitistisk seleksjon (velger fra topp 20% med høy sannsynlighet)
-    pub fn elitist_selection(shared_pop: &[(Solution, f64)]) -> Solution {
-        let mut rng = SmallRng::from_entropy();
-        
-        // Sorter etter fitness (lavere er bedre)
-        let mut sorted_pop = shared_pop.to_vec();
-        sorted_pop.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        // Velg blant de beste 20% med 80% sannsynlighet
-        let elite_count = (sorted_pop.len() as f64 * 0.2).ceil() as usize;
-        let elite_count = elite_count.max(1).min(sorted_pop.len());
-        
-        if rng.gen::<f64>() < 0.8 {
-            // Velg fra eliten
-            let idx = rng.gen_range(0..elite_count);
-            sorted_pop[idx].0.clone()
-        } else {
-            // Velg fra resten av populasjonen
-            let remaining = sorted_pop.len() - elite_count;
-            if remaining > 0 {
-                let idx = elite_count + rng.gen_range(0..remaining);
-                sorted_pop[idx].0.clone()
-            } else {
-                // Fallback hvis det ikke er noen ikke-elite individer
-                sorted_pop[0].0.clone()
-            }
-        }
-    }
-
-    // Samlet funksjon for å utføre seleksjon basert på den valgte metoden
-    /// Hjelpefunksjon for å utføre seleksjon basert på indekser i stedet for løsninger
-    pub fn perform_selection_idx(
-        shared_pop: &[(usize, f64)],
-        method: SelectionMethod,
-        tournament_size: usize,
-    ) -> usize {
-        match method {
-            SelectionMethod::Tournament => tournament_selection_idx(shared_pop, tournament_size),
-            SelectionMethod::Ranked => ranked_selection_idx(shared_pop),
-            SelectionMethod::Roulette => roulette_selection_idx(shared_pop),
-            SelectionMethod::Elitist => elitist_selection_idx(shared_pop),
-        }
-    }
-
-    /// Turneringsseleksjon som returnerer indeks i stedet for løsning
-    pub fn tournament_selection_idx(
-        shared_pop: &[(usize, f64)],
-        tournament_size: usize,
-    ) -> usize {
-        let mut rng = SmallRng::from_entropy();
-        let mut best_idx = None;
-        let mut best_fit = f64::INFINITY;
-        
-        for _ in 0..tournament_size {
-            let idx = rng.gen_range(0..shared_pop.len());
-            let candidate = &shared_pop[idx];
-            
-            if best_idx.is_none() || candidate.1 < best_fit {
-                best_idx = Some(candidate.0);
-                best_fit = candidate.1;
-            }
-        }
-        
-        best_idx.unwrap()
-    }
-
-    /// Rangbasert seleksjon som returnerer indeks
-    pub fn ranked_selection_idx(shared_pop: &[(usize, f64)]) -> usize {
-        let mut rng = SmallRng::from_entropy();
-        
-        // Sorter etter fitness (lavere er bedre)
-        let mut sorted_pop = shared_pop.to_vec();
-        sorted_pop.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        let n = sorted_pop.len();
-        let selection_pressure = 1.5;
-        
-        let mut probabilities = Vec::with_capacity(n);
-        let mut cum_prob = 0.0;
-        
-        for i in 0..n {
-            let prob = (2.0 - selection_pressure) / n as f64 + 
-                    ((2.0 * (i as f64)) * (selection_pressure - 1.0)) / (n * (n - 1)) as f64;
-            
-            cum_prob += prob;
-            probabilities.push(cum_prob);
-        }
-        
-        let r = rng.gen::<f64>();
-        for i in 0..n {
-            if r <= probabilities[i] {
-                return sorted_pop[i].0;
-            }
-        }
-        
-        sorted_pop[0].0
-    }
-
-    /// Ruletthjulseleksjon som returnerer indeks
-    pub fn roulette_selection_idx(shared_pop: &[(usize, f64)]) -> usize {
-        let mut rng = SmallRng::from_entropy();
-        
-        let min_fitness = shared_pop.iter()
-            .map(|(_, fit)| *fit)
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap_or(0.0);
-        
-        let max_fitness = shared_pop.iter()
-            .map(|(_, fit)| *fit)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap_or(1.0);
-        
-        let total_inverted_fitness: f64 = shared_pop.iter()
-            .map(|(_, fit)| max_fitness + min_fitness - *fit)
-            .sum();
-        
-        if total_inverted_fitness <= 0.0 {
-            let idx = rng.gen_range(0..shared_pop.len());
-            return shared_pop[idx].0;
-        }
-        
-        let r = rng.gen::<f64>() * total_inverted_fitness;
-        
-        let mut cum_prob = 0.0;
-        for (individual_idx, fit) in shared_pop {
-            cum_prob += max_fitness + min_fitness - fit;
-            if cum_prob >= r {
-                return *individual_idx;
-            }
-        }
-        
-        shared_pop.last().unwrap().0
-    }
-
-    /// Elitistisk seleksjon som returnerer indeks
-    pub fn elitist_selection_idx(shared_pop: &[(usize, f64)]) -> usize {
-        let mut rng = SmallRng::from_entropy();
-        
-        let mut sorted_pop = shared_pop.to_vec();
-        sorted_pop.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        let elite_count = (sorted_pop.len() as f64 * 0.2).ceil() as usize;
-        let elite_count = elite_count.max(1).min(sorted_pop.len());
-        
-        if rng.gen::<f64>() < 0.8 {
-            let idx = rng.gen_range(0..elite_count);
-            sorted_pop[idx].0
-        } else {
-            let remaining = sorted_pop.len() - elite_count;
-            if remaining > 0 {
-                let idx = elite_count + rng.gen_range(0..remaining);
-                sorted_pop[idx].0
-            } else {
-                sorted_pop[0].0
-            }
-        }
-    }
-
-
-    pub fn calculate_fitness_diversity(population: &[Solution], instance: &ProblemInstance) -> f64 {
-        if population.len() <= 1 {
-            return 0.0;
-        }
-        
-        let fitness_values: Vec<f64> = population.iter()
-            .map(|sol| fitness(sol, instance))
-            .collect();
-        
-        let mean = fitness_values.iter().sum::<f64>() / fitness_values.len() as f64;
-        let variance = fitness_values.iter()
-            .map(|&f| (f - mean).powi(2))
-            .sum::<f64>() / fitness_values.len() as f64;
-        
-        variance.sqrt() / mean  // Coefficient of variation
-    }
-
-    /// Fast approximation of population diversity with minimal performance impact
-    /// Omfattende diversitetsberegning som kombinerer flere mål
-    /// Returnerer en verdi mellom 0.0 (ingen diversitet) og 100.0 (maksimal diversitet)
-    pub fn calculate_comprehensive_diversity(
-        population: &[Solution], 
-        instance: &ProblemInstance
-    ) -> (f64, String) {
-        if population.len() <= 1 {
-            return (0.0, "Population for liten".to_string());
-        }
-        
-        // 1. Genotypisk diversitet - Beregn gjennomsnittlig Hamming-avstand
-        let mut total_hamming_distance = 0.0;
-        let mut pair_count = 0;
-        
-        // Sammenlign alle par av løsninger (O(n²), men OK siden dette bare kjøres sjelden)
-        for i in 0..population.len() {
-            for j in (i+1)..population.len() {
-                let sol1 = &population[i];
-                let sol2 = &population[j];
-                
-                // Finn den minste lengden for å unngå indekseringsfeiler
-                let min_len = sol1.flat.len().min(sol2.flat.len());
-                if min_len == 0 { continue; }
-                
-                // Beregn Hamming-avstand (antall posisjoner som er forskjellige)
-                let mut diff_count = 0;
-                for pos in 0..min_len {
-                    if sol1.flat[pos] != sol2.flat[pos] {
-                        diff_count += 1;
-                    }
+                    // Update the shared state with the improved solution
+                    *best_solution_ref.lock().unwrap() = best_solution.clone();
+                    *best_fitness_ref.lock().unwrap() = best_fitness;
+                    
+                    println!("Local search improved solution to {:.2}", best_fitness);
+                    local_search_improvements += 1;
+                    generations_no_improvement = 0;
+                    mutation_rate = 0.2; // Reset mutation rate 0.3
                 }
-                
-                // Legg til forskjeller for ulik lengde
-                let len_diff = (sol1.flat.len() as isize - sol2.flat.len() as isize).abs() as usize;
-                diff_count += len_diff;
-                
-                // Normaliser til prosent
-                let hamming_distance = (diff_count as f64 / min_len.max(1) as f64) * 100.0;
-                total_hamming_distance += hamming_distance;
-                pair_count += 1;
             }
         }
         
-        let genotypic_diversity = if pair_count > 0 {
-            total_hamming_distance / pair_count as f64
-        } else {
-            0.0
-        };
-        
-        // 2. Fenotypisk diversitet - Fitness-variasjon
-        let fitness_values: Vec<f64> = population.iter()
-            .map(|sol| fitness(sol, instance))
-            .collect();
-        
-        let mean_fitness = fitness_values.iter().sum::<f64>() / fitness_values.len() as f64;
-        let fitness_variance = fitness_values.iter()
-            .map(|&f| (f - mean_fitness).powi(2))
-            .sum::<f64>() / fitness_values.len() as f64;
-        
-        // Koeffisient for variasjon (CV)
-        let fitness_cv = if mean_fitness != 0.0 {
-            (fitness_variance.sqrt() / mean_fitness) * 100.0
-        } else {
-            0.0
-        };
-        
-        // 3. Strukturell diversitet - Variasjon i antall ruter
-        let route_counts: Vec<usize> = population.iter()
-            .map(|sol| sol.routes.len())
-            .collect();
-        
-        let unique_route_counts: std::collections::HashSet<_> = route_counts.iter().cloned().collect();
-        let structural_diversity = (unique_route_counts.len() as f64 / population.len() as f64) * 100.0;
-        
-        // 4. Rutelikhet - Sammenlign om de samme pasientene er i samme rekkefølge
-        let mut route_similarity_sum = 0.0;
-        let mut route_pair_count = 0;
-        
-        // Begrens til maks 20 løsninger for å spare tid (tilfeldig utvalg hvis flere)
-        let samples = if population.len() > 20 {
-            let mut rng = rand::thread_rng();
-            let mut indices: Vec<usize> = (0..population.len()).collect();
-            indices.shuffle(&mut rng);
-            indices.truncate(20);
-            indices.iter().map(|&i| &population[i]).collect()
-        } else {
-            population.iter().collect()
-        };
-        
-        let samples: Vec<&Solution> = samples;
-        
-        for i in 0..samples.len() {
-            for j in (i+1)..samples.len() {
-                let sol1 = samples[i];
-                let sol2 = samples[j];
-                
-                // Sammenlign ruter
-                let mut matched_routes = 0;
-                
-                for route1 in &sol1.routes {
-                    for route2 in &sol2.routes {
-                        if route1.len() != route2.len() { continue; }
-                        
-                        // Tell antall like elementer
-                        let mut matches = 0;
-                        for k in 0..route1.len() {
-                            if route1[k] == route2[k] {
-                                matches += 1;
-                            }
-                        }
-                        
-                        // Hvis mer enn 70% samsvar, regn det som en match
-                        if matches as f64 / route1.len() as f64 > 0.7 {
-                            matched_routes += 1;
-                            break; // Gå til neste route1
-                        }
-                    }
-                }
-                
-                // Beregn rutelikhet (lavere = mer diversitet)
-                let similarity = if sol1.routes.len() > 0 && sol2.routes.len() > 0 {
-                    matched_routes as f64 / sol1.routes.len().min(sol2.routes.len()) as f64
-                } else {
-                    0.0
-                };
-                
-                route_similarity_sum += similarity;
-                route_pair_count += 1;
-            }
+        // Log progress periodically (every 250 generations)
+        if generation % 250 == 0 && generation > 0 {
+            println!("Progress - Generation {}/{} ({}%)", 
+                     generation, generations, (generation * 100) / generations);
+            println!("  Current best fitness: {:.2}", best_fitness);
+            println!("  Local searches: {} (with {} improvements)", 
+                     local_search_applications, local_search_improvements);
+            println!("  Mutation rate: {:.2}", mutation_rate);
+            
+            // Reset counters for next report period
+            local_search_applications = 0;
+            mutation_rate_increases = 0;
         }
-        
-        let route_diversity = if route_pair_count > 0 {
-            (1.0 - route_similarity_sum / route_pair_count as f64) * 100.0
-        } else {
-            0.0
-        };
-        
-        // Beregn vektet gjennomsnitt av de ulike diversitetsmålene
-        let weights = [0.35, 0.25, 0.15, 0.25]; // Justerbare vekter
-        let diversity_metrics = [genotypic_diversity, fitness_cv, structural_diversity, route_diversity];
-        
-        let total_diversity = weights.iter()
-            .zip(diversity_metrics.iter())
-            .map(|(&w, &m)| w * m)
-            .sum::<f64>();
-        
-        // Lag en detaljert diversitetsrapport
-        let detail = format!(
-            "Diversitet: {:.1}% (Gen: {:.1}%, Fit: {:.1}%, Str: {:.1}%, Rut: {:.1}%)",
-            total_diversity, genotypic_diversity, fitness_cv, structural_diversity, route_diversity
-        );
-        
-        (total_diversity, detail)
     }
+    
+    // Print final summary
+    println!("\nSearch complete: Best fitness = {:.2}", best_fitness);
+    
+    // Final local search to improve the best solution
+    let final_solution = local_search(&best_solution, problem);
+    let final_fitness = evaluate_solution(&final_solution, problem);
+    
+    if final_fitness < best_fitness {
+        println!("Final local search improved solution from {:.2} to {:.2}", 
+                 best_fitness, final_fitness);
+        
+        // Update the shared state with the final improved solution
+        *best_solution_ref.lock().unwrap() = final_solution.clone();
+        *best_fitness_ref.lock().unwrap() = final_fitness;
+        
+        return final_solution;
+    }
+    
+    best_solution
 }
 
-mod local_search {
-    use crate::models::{simulate_route, ProblemInstance, Solution};
+// =================== LOCAL SEARCH FUNCTIONS ===================
 
-    /// To‑opt optimalisering innenfor én rute.
-    pub fn two_opt(route: &Vec<usize>, instance: &ProblemInstance) -> Vec<usize> {
-        let mut best_route = route.clone();
-        let (mut best_travel, _) =
-            simulate_route(&best_route, instance).unwrap_or((f64::INFINITY, 0.0));
-        let n = best_route.len();
-        let mut improved = true;
-        while improved {
-            improved = false;
-            for i in 0..n {
-                for j in i + 1..n {
-                    let mut new_route = best_route.clone();
-                    new_route[i..=j].reverse();
-                    if let Some((new_travel, _)) = simulate_route(&new_route, instance) {
-                        if new_travel < best_travel {
-                            best_travel = new_travel;
-                            best_route = new_route;
-                            improved = true;
-                        }
-                    }
-                }
-            }
-        }
-        best_route
-    }
-
-    /// Swap-optimalisering innenfor én rute.
-    pub fn swap_optimization(route: &Vec<usize>, instance: &ProblemInstance) -> Vec<usize> {
-        let mut best_route = route.clone();
-        let mut best_travel = simulate_route(&best_route, instance)
-            .map(|(t, _)| t)
-            .unwrap_or(f64::INFINITY);
-        let n = best_route.len();
-        let mut improved = true;
-        while improved {
-            improved = false;
-            for i in 0..n {
-                for j in i + 1..n {
-                    let mut new_route = best_route.clone();
-                    new_route.swap(i, j);
-                    if let Some((new_travel, _)) = simulate_route(&new_route, instance) {
-                        if new_travel < best_travel {
-                            best_travel = new_travel;
-                            best_route = new_route;
-                            improved = true;
-                        }
-                    }
-                }
-            }
-        }
-        best_route
-    }
-
-    /// Kombinerer to‑opt og swap for et utvidet lokalt søk.
-    pub fn extended_local_search(route: &Vec<usize>, instance: &ProblemInstance) -> Vec<usize> {
-        let route_after_two_opt = two_opt(route, instance);
-        swap_optimization(&route_after_two_opt, instance)
+/// Applies local search to improve a solution using multiple neighborhood operators.
+/// Continues until no further improvements are found or max iterations reached.
+/// 
+/// # Arguments
+/// * `solution` - The solution to improve
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `Solution` - The improved solution
+fn local_search(solution: &Solution, problem: &Problem) -> Solution {
+    let mut improved_solution = solution.clone();
+    let mut improved = true;
+    let mut iterations = 0;
+    let max_iterations = 100; // Limit iterations to prevent infinite loops
+    
+    while improved && iterations < max_iterations {
+        improved = false;
+        iterations += 1;
+        
+        // Try various local search operators
+        
+        // 1. Relocate move: Move a patient from one route to another
+        improved |= try_relocate_move(&mut improved_solution, problem);
+        
+        // 2. Exchange move: Swap two patients between different routes
+        improved |= try_exchange_move(&mut improved_solution, problem);
+        
+        // 3. 2-opt: Reverse a segment within a route
+        improved |= try_2opt_move(&mut improved_solution, problem);
+        
+        // 4. Or-opt: Move a segment of consecutive patients
+        improved |= try_or_opt_move(&mut improved_solution, problem);
     }
     
-    /// OPTIMIZATION: Applies local search to a complete solution
-    pub fn apply_local_search(solution: &mut Solution, instance: &ProblemInstance) {
-        let mut improved_routes = Vec::with_capacity(solution.routes.len());
-        
-        for route in &solution.routes {
-            if route.len() > 1 {
-                let improved_route = extended_local_search(route, instance);
-                improved_routes.push(improved_route);
-            } else {
-                improved_routes.push(route.clone());
-            }
-        }
-        
-        solution.routes = improved_routes;
-        
-        // Update flat representation to match the improved routes
-        crate::models::update_flat_from_routes(solution);
-    }
+    improved_solution
+}
+
+/// Attempts to relocate a patient from one route to another to reduce total travel time.
+/// Tries all possible (from_route, patient, to_route, position) combinations.
+/// 
+/// # Arguments
+/// * `solution` - The solution to modify
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `bool` - True if an improvement was found and applied
+fn try_relocate_move(solution: &mut Solution, problem: &Problem) -> bool {
+    let mut best_improvement = 0.0;
+    let mut best_move: Option<(usize, usize, usize, usize)> = None; // (from_nurse, patient_pos, to_nurse, insert_pos)
     
-    /// OPTIMIZATION: Relocate operator that moves a patient between routes
-    pub fn relocate_between_routes(solution: &mut Solution, instance: &ProblemInstance) -> bool {
-        let num_routes = solution.routes.len();
-        if num_routes <= 1 {
-            return false;
+    // For each nurse route
+    for from_nurse in 0..solution.len() {
+        let from_route = &solution[from_nurse];
+        
+        if from_route.is_empty() {
+            continue;
         }
         
-        let mut improved = false;
-        let mut best_cost = crate::ga::fitness(solution, instance);
-        
-        // Try all possible patient relocations between routes
-        'outer: for from_route in 0..num_routes {
-            if solution.routes[from_route].is_empty() {
-                continue;
-            }
+        // For each patient in the route
+        for patient_pos in 0..from_route.len() {
+            let patient_id = from_route[patient_pos];
             
-            for to_route in 0..num_routes {
-                if from_route == to_route {
+            // Calculate cost without this patient
+            let mut temp_route = from_route.clone();
+            temp_route.remove(patient_pos);
+            let old_cost = calculate_route_travel_time(from_route, problem);
+            let new_cost_from = calculate_route_travel_time(&temp_route, problem);
+            let change_from = new_cost_from - old_cost;
+            
+            // Try inserting into every other route
+            for to_nurse in 0..solution.len() {
+                if to_nurse == from_nurse {
                     continue;
                 }
                 
-                // Iterate safely by using indices up to the current length
-                let from_route_len = solution.routes[from_route].len();
-                for i in 0..from_route_len {
-                    // Skip if the route has been modified and is now shorter
-                    if i >= solution.routes[from_route].len() {
-                        continue;
-                    }
+                let to_route = &solution[to_nurse];
+                
+                // Try every position in the target route
+                for insert_pos in 0..=to_route.len() {
+                    let mut new_route = to_route.clone();
+                    new_route.insert(insert_pos, patient_id);
                     
-                    let patient_id = solution.routes[from_route][i];
-                    
-                    // Try inserting at each position in the destination route
-                    for j in 0..=solution.routes[to_route].len() {
-                        // Create a copy of the solution
-                        let mut test_sol = solution.clone();
+                    // Check if the new route is valid
+                    if is_valid_route(&new_route, to_nurse, problem) {
+                        let old_cost_to = calculate_route_travel_time(to_route, problem);
+                        let new_cost_to = calculate_route_travel_time(&new_route, problem);
+                        let change_to = new_cost_to - old_cost_to;
                         
-                        // Remove from original route
-                        let patient = test_sol.routes[from_route].remove(i);
+                        // Calculate total cost change
+                        let total_change = change_from + change_to;
                         
-                        // Insert into destination route
-                        test_sol.routes[to_route].insert(j, patient);
-                        
-                        // Remove empty routes
-                        test_sol.routes.retain(|r| !r.is_empty());
-                        
-                        // Update flat representation
-                        crate::models::update_flat_from_routes(&mut test_sol);
-                        
-                        // Check if solution is valid and better
-                        if crate::models::validate_solution(&test_sol, instance) {
-                            let new_cost = crate::ga::fitness(&test_sol, instance);
-                            if new_cost < best_cost {
-                                *solution = test_sol;
-                                best_cost = new_cost;
-                                improved = true;
-                                
-                                // Since we modified the solution, we need to break and restart
-                                // as the routes structure has changed
-                                break 'outer;
-                            }
+                        if total_change < best_improvement {
+                            best_improvement = total_change;
+                            best_move = Some((from_nurse, patient_pos, to_nurse, insert_pos));
                         }
                     }
                 }
             }
         }
-        
-        improved
     }
+    
+    // Apply the best move if found
+    if let Some((from_nurse, patient_pos, to_nurse, insert_pos)) = best_move {
+        let patient_id = solution[from_nurse][patient_pos];
+        solution[from_nurse].remove(patient_pos);
+        solution[to_nurse].insert(insert_pos, patient_id);
+        return true;
+    }
+    
+    false
 }
 
-mod plotting {
-    use crate::models::{ProblemInstance, Solution};
-    use plotters::prelude::*;
-
-    /// Plotter den beste ruteplanen med ulike farger for hver rute.
-    pub fn plot_solution(
-        instance: &ProblemInstance,
-        solution: &Solution,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let depot = &instance.depot;
-        let mut min_x = depot.x_coord;
-        let mut max_x = depot.x_coord;
-        let mut min_y = depot.y_coord;
-        let mut max_y = depot.y_coord;
-        for patient in instance.patients.values() {
-            min_x = min_x.min(patient.x_coord);
-            max_x = max_x.max(patient.x_coord);
-            min_y = min_y.min(patient.y_coord);
-            max_y = max_y.max(patient.y_coord);
+/// Attempts to exchange two patients between different routes to reduce total travel time.
+/// Tries all possible (route1, patient1, route2, patient2) combinations.
+/// 
+/// # Arguments
+/// * `solution` - The solution to modify
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `bool` - True if an improvement was found and applied
+fn try_exchange_move(solution: &mut Solution, problem: &Problem) -> bool {
+    let mut best_improvement = 0.0;
+    let mut best_move: Option<(usize, usize, usize, usize)> = None; // (nurse1, pos1, nurse2, pos2)
+    
+    // For each pair of nurse routes
+    for nurse1 in 0..solution.len() {
+        let route1 = &solution[nurse1];
+        
+        if route1.is_empty() {
+            continue;
         }
-        let margin = 10.0;
-        min_x -= margin;
-        max_x += margin;
-        min_y -= margin;
-        max_y += margin;
-        let root = BitMapBackend::new("solution.png", (800, 600)).into_drawing_area();
-        root.fill(&WHITE)?;
-        let mut chart = ChartBuilder::on(&root)
-            .caption("Beste ruteplan", ("sans-serif", 40))
-            .margin(10)
-            .x_label_area_size(40)
-            .y_label_area_size(40)
-            .build_cartesian_2d(min_x..max_x, min_y..max_y)?;
-        chart.configure_mesh().draw()?;
-        let colors = vec![&RED, &BLUE, &GREEN, &MAGENTA, &CYAN, &YELLOW, &BLACK];
-        for (i, route) in solution.routes.iter().enumerate() {
-            let color = colors[i % colors.len()];
-            let mut points = Vec::new();
-            points.push((depot.x_coord, depot.y_coord));
-            for &patient_id in route {
-                let patient = instance.patients.get(&patient_id.to_string()).unwrap();
-                points.push((patient.x_coord, patient.y_coord));
+        
+        for nurse2 in nurse1+1..solution.len() {
+            let route2 = &solution[nurse2];
+            
+            if route2.is_empty() {
+                continue;
             }
-            points.push((depot.x_coord, depot.y_coord));
-            chart.draw_series(LineSeries::new(points, color.stroke_width(3)))?;
+            
+            // For each patient in the first route
+            for pos1 in 0..route1.len() {
+                let patient1 = route1[pos1];
+                
+                // For each patient in the second route
+                for pos2 in 0..route2.len() {
+                    let patient2 = route2[pos2];
+                    
+                    // Create new routes with patients swapped
+                    let mut new_route1 = route1.clone();
+                    let mut new_route2 = route2.clone();
+                    
+                    new_route1[pos1] = patient2;
+                    new_route2[pos2] = patient1;
+                    
+                    // Check if both new routes are valid
+                    if is_valid_route(&new_route1, nurse1, problem) && 
+                       is_valid_route(&new_route2, nurse2, problem) {
+                        
+                        let old_cost1 = calculate_route_travel_time(route1, problem);
+                        let old_cost2 = calculate_route_travel_time(route2, problem);
+                        let new_cost1 = calculate_route_travel_time(&new_route1, problem);
+                        let new_cost2 = calculate_route_travel_time(&new_route2, problem);
+                        
+                        let total_change = (new_cost1 + new_cost2) - (old_cost1 + old_cost2);
+                        
+                        if total_change < best_improvement {
+                            best_improvement = total_change;
+                            best_move = Some((nurse1, pos1, nurse2, pos2));
+                        }
+                    }
+                }
+            }
         }
-        chart.draw_series(std::iter::once(Circle::new(
-            (depot.x_coord, depot.y_coord),
-            5,
-            ShapeStyle::from(&BLACK).filled(),
-        )))?;
-        for patient in instance.patients.values() {
-            chart.draw_series(std::iter::once(Circle::new(
-                (patient.x_coord, patient.y_coord),
-                3,
-                ShapeStyle::from(&RGBColor(128, 128, 128)).filled(),
-            )))?;
-        }
-        root.present()?;
-        println!("Plot lagret som solution.png");
-        Ok(())
     }
-
-    /// Plotter fitnesshistorikk (raw fitness per generasjon).
-    pub fn plot_fitness_history(
-        history: &Vec<(usize, f64)>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let data = if history.len() > 1 {
-            &history[1..]
-        } else {
-            &history[..]
-        };
-        let gen_min = data.first().map(|(g, _)| *g).unwrap_or(0);
-        let gen_max = data.last().map(|(g, _)| *g).unwrap_or(0);
-        let y_min = data
-            .iter()
-            .map(|(_, fit)| *fit)
-            .fold(f64::INFINITY, f64::min);
-        let y_max = data
-            .iter()
-            .map(|(_, fit)| *fit)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let root = BitMapBackend::new("fitness_history.png", (800, 600)).into_drawing_area();
-        root.fill(&WHITE)?;
-        let mut chart = ChartBuilder::on(&root)
-            .caption("Fitness Historikk", ("sans-serif", 40))
-            .margin(10)
-            .x_label_area_size(40)
-            .y_label_area_size(60)
-            .build_cartesian_2d(gen_min..gen_max, y_min..y_max)?;
-        chart.configure_mesh().draw()?;
-        chart.draw_series(LineSeries::new(data.to_vec(), &RED))?;
-        root.present()?;
-        println!("Fitness-historikk plottet som fitness_history.png");
-        Ok(())
+    
+    // Apply the best move if found
+    if let Some((nurse1, pos1, nurse2, pos2)) = best_move {
+        let patient1 = solution[nurse1][pos1];
+        let patient2 = solution[nurse2][pos2];
+        
+        solution[nurse1][pos1] = patient2;
+        solution[nurse2][pos2] = patient1;
+        return true;
     }
+    
+    false
 }
 
-mod island {
-    use crate::ga;
-    use crate::local_search;
-    use crate::models::{ProblemInstance, Solution};
-    use rand::seq::SliceRandom;
-    use rand::Rng;
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    // Modifiser island::run_island_model for å bruke ulike seleksjonsmetoder per øy
-    pub fn run_island_model(
-        instance: &ProblemInstance,
-        num_islands: usize,
-        population_size: usize,
-        num_generations: usize,
-        migration_interval: usize,
-        migration_size: usize,
-        initial_mutation_rate: f64,
-        final_mutation_rate: f64, 
-        crossover_rate: f64,
-        elitism_count: usize,
-        tournament_size: usize,
-        sigma_share: f64,
-        alpha: f64,
-        memetic_rate: f64,
-        stagnation_generations: usize,
-        time_limit: Option<Duration>,
-    ) -> (Solution, f64, Vec<(usize, f64)>) {
-        let island_pop_size = population_size / num_islands;
+/// Tries to improve a solution by applying the 2-opt operator (reversing segments within routes).
+/// For each route, tries all possible segment inversions that improve travel time.
+/// 
+/// # Arguments
+/// * `solution` - The solution to modify
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `bool` - True if an improvement was found and applied
+fn try_2opt_move(solution: &mut Solution, problem: &Problem) -> bool {
+    let mut improved = false;
+    
+    // For each nurse route
+    for nurse_id in 0..solution.len() {
+        let route = &mut solution[nurse_id];
         
-        // Tildel ulike seleksjonsmetoder til hver øy
-        let selection_methods = [
-            ga::SelectionMethod::Tournament,
-            ga::SelectionMethod::Ranked,
-            ga::SelectionMethod::Roulette,
-            ga::SelectionMethod::Elitist
-        ];
+        if route.len() < 3 {
+            continue; // Need at least 3 patients for 2-opt to make sense
+        }
         
-        // Generer initial populasjon for hver øy
-        let mut islands: Vec<Vec<Solution>> = (0..num_islands)
-            .map(|_| ga::generate_population(island_pop_size, instance))
-            .collect();
+        let orig_cost = calculate_route_travel_time(route, problem);
+        
+        // Try all possible segment reversals
+        for i in 0..route.len()-1 {
+            for j in i+1..route.len() {
+                // Reverse the segment [i..=j]
+                route[i..=j].reverse();
                 
-        let mut best_solution_overall: Option<Solution> = None;
-        let mut best_fitness_overall = f64::INFINITY;
-        let mut fitness_history = Vec::new();
+                // Check if the new route is valid and better
+                if is_valid_route(route, nurse_id, problem) {
+                    let new_cost = calculate_route_travel_time(route, problem);
+                    
+                    if new_cost < orig_cost {
+                        improved = true;
+                        break; // Accept first improvement
+                    } else {
+                        // Revert if not improved
+                        route[i..=j].reverse();
+                    }
+                } else {
+                    // Revert if not valid
+                    route[i..=j].reverse();
+                }
+            }
+            
+            if improved {
+                break;
+            }
+        }
+    }
+    
+    improved
+}
+
+/// Tries to improve a solution by relocating a segment of consecutive patients.
+/// Similar to relocate, but moves multiple patients at once.
+/// 
+/// # Arguments
+/// * `solution` - The solution to modify
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `bool` - True if an improvement was found and applied
+fn try_or_opt_move(solution: &mut Solution, problem: &Problem) -> bool {
+    let mut best_improvement = 0.0;
+    let mut best_move: Option<(usize, usize, usize, usize, Vec<usize>)> = None; // (from_nurse, start_pos, to_nurse, insert_pos, segment)
+    let segment_length = 2; // Try moving 2 consecutive patients
+    
+    // For each nurse route
+    for from_nurse in 0..solution.len() {
+        let route = &solution[from_nurse];
         
-        // Track stagnation
-        let mut generations_without_improvement = 0;
+        if route.len() < segment_length + 1 {
+            continue; // Need enough patients for segment plus at least one more
+        }
         
-        // For time limit tracking
-        let start_time = Instant::now();
-        let should_stop = Arc::new(AtomicBool::new(false));
+        // Try relocating a segment of patients
+        for start_pos in 0..=route.len()-segment_length {
+            // Extract the segment
+            let segment: Vec<usize> = route[start_pos..start_pos+segment_length].to_vec();
+            
+            // Try placing the segment in each route (including the same route)
+            for to_nurse in 0..solution.len() {
+                let to_route = if to_nurse == from_nurse {
+                    // Create a temporary route without the segment
+                    let mut temp_route = route.clone();
+                    for _ in 0..segment_length {
+                        temp_route.remove(start_pos);
+                    }
+                    temp_route
+                } else {
+                    solution[to_nurse].clone()
+                };
+                
+                // Try every insertion position
+                for insert_pos in 0..=to_route.len() {
+                    // Skip invalid insertions in the same route
+                    if to_nurse == from_nurse && 
+                      (insert_pos >= start_pos && insert_pos <= start_pos + segment_length) {
+                        continue;
+                    }
+                    
+                    // Create the new route with the segment inserted
+                    let mut new_route = to_route.clone();
+                    for (i, &patient_id) in segment.iter().enumerate() {
+                        new_route.insert(insert_pos + i, patient_id);
+                    }
+                    
+                    // Check if the new route is valid
+                    if is_valid_route(&new_route, to_nurse, problem) {
+                        // Calculate cost difference
+                        let old_from_cost = calculate_route_travel_time(route, problem);
+                        let old_to_cost = if to_nurse == from_nurse {
+                            0.0 // Already included in old_from_cost
+                        } else {
+                            calculate_route_travel_time(&to_route, problem)
+                        };
+                        
+                        // Create temporary solution with the move applied
+                        let mut temp_solution = solution.clone();
+                        
+                        // Remove segment from original route
+                        for _ in 0..segment_length {
+                            temp_solution[from_nurse].remove(start_pos);
+                        }
+                        
+                        // Insert segment into target route
+                        for (i, &patient_id) in segment.iter().enumerate() {
+                            let actual_insert_pos = if to_nurse == from_nurse && insert_pos > start_pos {
+                                // Adjust position if inserting later in the same route
+                                insert_pos - segment_length + i
+                            } else {
+                                insert_pos + i
+                            };
+                            
+                            temp_solution[to_nurse].insert(actual_insert_pos, patient_id);
+                        }
+                        
+                        let new_from_cost = calculate_route_travel_time(&temp_solution[from_nurse], problem);
+                        let new_to_cost = if to_nurse == from_nurse {
+                            0.0 // Already included in new_from_cost
+                        } else {
+                            calculate_route_travel_time(&temp_solution[to_nurse], problem)
+                        };
+                        
+                        let total_change = (new_from_cost + new_to_cost) - (old_from_cost + old_to_cost);
+                        
+                        if total_change < best_improvement {
+                            best_improvement = total_change;
+                            best_move = Some((from_nurse, start_pos, to_nurse, insert_pos, segment.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Apply the best move if found
+    if let Some((from_nurse, start_pos, to_nurse, insert_pos, segment)) = best_move {
+        // Apply the move to the solution
         
-        // OPTIMALISERING: Alloker indeks-vektorer én gang for hver øy
-        let mut islands_indices: Vec<Vec<usize>> = (0..num_islands)
-            .map(|_| Vec::with_capacity(island_pop_size))
-            .collect();
+        // Remove segment from original route
+        for _ in 0..segment.len() {
+            solution[from_nurse].remove(start_pos);
+        }
         
-        for gen in 0..num_generations {
-            // Check time limit if set
-            if let Some(limit) = time_limit {
-                if start_time.elapsed() >= limit {
-                    println!("Time limit reached after {} generations", gen);
+        // Insert segment into target route
+        for (i, &patient_id) in segment.iter().enumerate() {
+            let actual_insert_pos = if to_nurse == from_nurse && insert_pos > start_pos {
+                // Adjust position if inserting later in the same route
+                insert_pos - segment.len() + i
+            } else {
+                insert_pos + i
+            };
+            
+            solution[to_nurse].insert(actual_insert_pos, patient_id);
+        }
+        
+        return true;
+    }
+    
+    false
+}
+
+// =================== POPULATION INITIALIZATION ===================
+
+/// Initializes a population of solutions for the genetic algorithm.
+/// Creates diverse starting solutions using a randomized greedy approach.
+/// 
+/// # Arguments
+/// * `problem` - The problem instance
+/// * `population_size` - The number of solutions to generate
+/// 
+/// # Returns
+/// * `Vec<Solution>` - A vector of initial solutions
+fn initialize_population(problem: &Problem, population_size: usize) -> Vec<Solution> {
+    let mut population = Vec::with_capacity(population_size);
+    
+    for _ in 0..population_size {
+        let mut solution = generate_greedy_solution(problem);
+        repair_solution(&mut solution, problem);
+        population.push(solution);
+    }
+    
+    population
+}
+
+/// Generates a solution using a randomized greedy approach.
+/// Assigns patients one by one to the best feasible position.
+/// 
+/// # Arguments
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `Solution` - A new solution
+fn generate_greedy_solution(problem: &Problem) -> Solution {
+    let num_patients = problem.patients.len();
+    let num_nurses = problem.nbr_nurses;
+    
+    let mut solution = vec![Vec::new(); num_nurses];
+    let mut unassigned: Vec<usize> = (1..=num_patients).collect();
+    unassigned.shuffle(&mut rand::thread_rng());
+    
+    for patient_id in unassigned {
+        let mut best_nurse = 0;
+        let mut best_position = 0;
+        let mut best_cost_increase = f64::INFINITY;
+        
+        for nurse_id in 0..num_nurses {
+            let route = &solution[nurse_id];
+            
+            // Try each possible insertion position
+            for pos in 0..=route.len() {
+                let mut new_route = route.clone();
+                new_route.insert(pos, patient_id);
+                
+                // Check if insertion is valid
+                if is_valid_route(&new_route, nurse_id, problem) {
+                    let old_cost = calculate_route_travel_time(route, problem);
+                    let new_cost = calculate_route_travel_time(&new_route, problem);
+                    let cost_increase = new_cost - old_cost;
+                    
+                    if cost_increase < best_cost_increase {
+                        best_nurse = nurse_id;
+                        best_position = pos;
+                        best_cost_increase = cost_increase;
+                    }
+                }
+            }
+        }
+        
+        // If we found a valid position, insert the patient
+        if best_cost_increase < f64::INFINITY {
+            solution[best_nurse].insert(best_position, patient_id);
+        } else {
+            // If no valid position found, create a new route for this patient
+            let nurse_id = rand::thread_rng().gen_range(0..num_nurses);
+            solution[nurse_id] = vec![patient_id];
+        }
+    }
+    
+    solution
+}
+
+// =================== SOLUTION REPAIR FUNCTIONS ===================
+
+/// Fixes time window violations in a nurse's route.
+/// Handles cases where patients can't be visited within their time windows
+/// or the nurse can't return to depot on time.
+/// 
+/// # Arguments
+/// * `solution` - The solution to repair
+/// * `nurse_id` - The nurse route to check
+/// * `problem` - The problem instance
+fn fix_time_window_violation(solution: &mut Solution, nurse_id: usize, problem: &Problem) {
+    let route = &solution[nurse_id];
+    
+    if route.is_empty() {
+        return; // Empty route is valid
+    }
+    
+    // Check if the route violates time window constraints
+    let mut current_time = 0.0;
+    let mut current_location = 0; // depot
+    let mut violations = Vec::new();
+    
+    for (idx, &patient_id) in route.iter().enumerate() {
+        // Travel to patient
+        current_time += problem.travel_times[current_location][patient_id];
+        current_location = patient_id;
+        
+        let patient = problem.patients.get(&patient_id.to_string()).unwrap();
+        
+        // Check if we arrived too late
+        if current_time > patient.end_time as f64 {
+            violations.push((idx, patient_id));
+        }
+        
+        // Wait if arrived early
+        if current_time < patient.start_time as f64 {
+            current_time = patient.start_time as f64;
+        }
+        
+        // Care for patient
+        current_time += patient.care_time as f64;
+    }
+    
+    // Check if return to depot is on time
+    current_time += problem.travel_times[current_location][0];
+    if current_time > problem.depot.return_time as f64 {
+        // If can't return on time, add the last patient to violations
+        if !route.is_empty() {
+            violations.push((route.len() - 1, route[route.len() - 1]));
+        }
+    }
+    
+    if violations.is_empty() {
+        return; // No violations
+    }
+    
+    let mut route = route.clone();
+    
+    // Sort violations in reverse order (to remove from the end)
+    violations.sort_by(|a, b| b.0.cmp(&a.0));
+    
+    // Remove violating patients
+    for (idx, patient_id) in violations {
+        if idx < route.len() { // Safety check
+            route.remove(idx);
+            
+            // Try to insert this patient into another nurse's route
+            let mut inserted = false;
+            
+            for other_nurse_id in 0..solution.len() {
+                if other_nurse_id == nurse_id {
+                    continue;
+                }
+                
+                let other_route = &solution[other_nurse_id];
+                
+                // Try each possible insertion position
+                for pos in 0..=other_route.len() {
+                    let mut new_route = other_route.clone();
+                    new_route.insert(pos, patient_id);
+                    
+                    if is_valid_route(&new_route, other_nurse_id, problem) {
+                        solution[other_nurse_id] = new_route;
+                        inserted = true;
+                        break;
+                    }
+                }
+                
+                if inserted {
                     break;
                 }
             }
             
-            // Check if stopping flag is set
-            if should_stop.load(Ordering::Relaxed) {
-                println!("Early stopping triggered at generation {}", gen);
-                break;
-            }
-            
-            // Calculate adaptive mutation rate based on progress
-            let progress = (gen as f64) / (num_generations as f64);
-            let current_mutation_rate = initial_mutation_rate 
-                - progress * (initial_mutation_rate - final_mutation_rate);
-            
-            // Evolve each island
-            for island_idx in 0..islands.len() {
-                let island = &mut islands[island_idx];
-                
-                // Velg seleksjonsmetode for denne øya
-                let selection_method = selection_methods[island_idx % selection_methods.len()];
-                
-                // Compute shared fitness for current island (returnerer nå indekser)
-                let shared_pop = ga::compute_shared_fitness(island, instance, sigma_share, alpha);
-                
-                // Gjenbruk indeks-vektoren for denne øya
-                let indices = &mut islands_indices[island_idx];
-                indices.clear();
-                indices.extend(0..shared_pop.len());
-                
-                // Sort by shared fitness
-                indices.sort_by(|&a, &b| shared_pop[a].1.partial_cmp(&shared_pop[b].1).unwrap());
-                
-                // Best løsning er nå island[shared_pop[indices[0]].0]
-                let best_idx = shared_pop[indices[0]].0;
-                let best_fitness = shared_pop[indices[0]].1;
-                
-                if best_fitness < best_fitness_overall {
-                    best_fitness_overall = best_fitness;
-                    best_solution_overall = Some(island[best_idx].clone());
-                    generations_without_improvement = 0;
-                } else {
-                    generations_without_improvement += 1;
-                }
-                
-                // Log fitness periodically
-                if gen % 250 == 0 || gen == num_generations - 1 {
-                    let raw = ga::fitness(&island[best_idx], instance);
-                    fitness_history.push((gen, raw));
-    
-                    let (diversity_value, diversity_detail) = ga::calculate_comprehensive_diversity(island, instance);
-    
-                    println!(
-                        "Gen {}: Best shared fitness (island{}, {:?}) = {:.2}, raw = {:.2}",
-                        gen, island_idx, selection_method, best_fitness, raw
-                    );
-                    println!("    {}", diversity_detail);
-                }
-                
-                // Apply local search to a subset of the population (memetic algorithm)
-                if memetic_rate > 0.0 {
-                    // Kjør memetic-algoritmen mindre hyppig i tidlige generasjoner
-                    let should_apply_memetic = gen % (5 + (10.0 * (1.0 - progress)) as usize) == 0;
-                    
-                    if should_apply_memetic {
-                        let adaptive_memetic_rate = memetic_rate * (0.5 + 0.5 * progress);
-                        let ls_count = (island_pop_size as f64 * adaptive_memetic_rate).ceil() as usize;
-                        
-                        for i in 0..ls_count.min(island.len()) {
-                            local_search::apply_local_search(&mut island[i], instance);
-                            
-                            let inter_route_probability = 0.2 + 0.6 * progress;
-                            if i < ls_count / 3 || rand::random::<f64>() < inter_route_probability {
-                                let iterations = 1 + (2.0 * progress) as usize;
-                                for _ in 0..iterations {
-                                    local_search::relocate_between_routes(&mut island[i], instance);
-                                }
-                            }
-                        }
+            // If not inserted, create a new nurse route if possible
+            if !inserted {
+                for new_nurse_id in 0..solution.len() {
+                    if solution[new_nurse_id].is_empty() {
+                        solution[new_nurse_id] = vec![patient_id];
+                        inserted = true;
+                        break;
                     }
                 }
-                
-                // Keep elites - bruk nå indekser for å hente ut elitene
-                let mut new_population: Vec<Solution> = indices
-                    .iter()
-                    .take(elitism_count)
-                    .map(|&i| island[shared_pop[i].0].clone())
-                    .collect();
-                
-                // Create new offspring via crossover and mutation
-                let mut rng = rand::thread_rng();
-                while new_population.len() < island_pop_size {
-                    // Bruk øyas tildelte seleksjonsmetode og indeksene for å velge foreldre
-                    let parent1_idx = ga::perform_selection_idx(&shared_pop, selection_method, tournament_size);
-                    let parent2_idx = ga::perform_selection_idx(&shared_pop, selection_method, tournament_size);
-                    
-                    let parent1 = &island[parent1_idx];
-                    let parent2 = &island[parent2_idx];
-                    
-                    let mut child = if rng.gen::<f64>() < crossover_rate {
-                        let crossover_type = rng.gen_range(0..2);
-                        ga::crossover(parent1, parent2, instance, crossover_type)
-                    } else {
-                        parent1.clone()
-                    };
-                    
-                    child = ga::mutate(&child, current_mutation_rate, instance);
-                    new_population.push(child);
-                }
-                
-                *island = new_population;
+            }
+        }
+    }
+    
+    solution[nurse_id] = route;
+}
+
+/// Checks if a route is valid by verifying that:
+/// 1. The total demand doesn't exceed nurse capacity
+/// 2. All patients are visited within their time windows
+/// 3. The nurse returns to depot on time
+/// 
+/// # Arguments
+/// * `route` - The route to check
+/// * `_nurse_id` - The nurse ID (unused but kept for consistency)
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `bool` - True if the route is valid
+fn is_valid_route(route: &[usize], _nurse_id: usize, problem: &Problem) -> bool {
+    if route.is_empty() {
+        return true;
+    }
+    
+    // Check capacity constraint
+    let total_demand: usize = route.iter()
+        .map(|&patient_id| problem.patients.get(&patient_id.to_string()).unwrap().demand)
+        .sum();
+    
+    if total_demand > problem.capacity_nurse {
+        return false;
+    }
+    
+    // Check time window and return time constraints
+    let mut current_time = 0.0;
+    let mut current_location = 0; // depot
+    
+    for &patient_id in route {
+        // Travel to patient
+        current_time += problem.travel_times[current_location][patient_id];
+        current_location = patient_id;
+        
+        let patient = problem.patients.get(&patient_id.to_string()).unwrap();
+        
+        // Check if we arrived too late
+        if current_time > patient.end_time as f64 {
+            return false;
+        }
+        
+        // Wait if arrived early
+        if current_time < patient.start_time as f64 {
+            current_time = patient.start_time as f64;
+        }
+        
+        // Care for patient
+        current_time += patient.care_time as f64;
+    }
+    
+    // Travel back to depot
+    current_time += problem.travel_times[current_location][0];
+    
+    // Check if we return to depot on time
+    current_time <= problem.depot.return_time as f64
+}
+
+// =================== SOLUTION EVALUATION FUNCTIONS ===================
+
+/// Evaluates all solutions in a population.
+/// 
+/// # Arguments
+/// * `population` - The population of solutions
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `Vec<f64>` - Vector of fitness values for each solution
+fn evaluate_population(population: &[Solution], problem: &Problem) -> Vec<f64> {
+    population.iter().map(|solution| evaluate_solution(solution, problem)).collect()
+}
+
+/// Evaluates a solution based on total travel time across all routes.
+/// Lower values are better.
+/// 
+/// # Arguments
+/// * `solution` - The solution to evaluate
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `f64` - The total travel time
+fn evaluate_solution(solution: &Solution, problem: &Problem) -> f64 {
+    let mut total_travel_time = 0.0;
+    
+    for route in solution {
+        total_travel_time += calculate_route_travel_time(route, problem);
+    }
+    
+    total_travel_time
+}
+
+/// Calculates the travel time for a single route.
+/// Includes travel from depot to first patient, between patients, and back to depot.
+/// 
+/// # Arguments
+/// * `route` - The route to evaluate
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `f64` - The route's travel time
+fn calculate_route_travel_time(route: &[usize], problem: &Problem) -> f64 {
+    if route.is_empty() {
+        return 0.0;
+    }
+    
+    let mut travel_time = problem.travel_times[0][route[0]]; // Depot to first patient
+    
+    for i in 0..route.len() - 1 {
+        travel_time += problem.travel_times[route[i]][route[i + 1]]; // Between patients
+    }
+    
+    travel_time += problem.travel_times[route[route.len() - 1]][0]; // Last patient to depot
+    
+    travel_time
+}
+
+// =================== GENETIC ALGORITHM OPERATORS ===================
+
+/// Performs tournament selection to choose a solution from the population.
+/// Selects the best solution from a random sample of tournament_size solutions.
+/// 
+/// # Arguments
+/// * `fitness_values` - The fitness values for the population
+/// * `tournament_size` - The number of solutions to include in each tournament
+/// 
+/// # Returns
+/// * `usize` - The index of the selected solution
+fn tournament_selection(fitness_values: &[f64], tournament_size: usize) -> usize {
+    let mut rng = rand::thread_rng();
+    let mut best_idx = rng.gen_range(0..fitness_values.len());
+    let mut best_fitness = fitness_values[best_idx];
+    
+    for _ in 1..tournament_size {
+        let idx = rng.gen_range(0..fitness_values.len());
+        if fitness_values[idx] < best_fitness {
+            best_idx = idx;
+            best_fitness = fitness_values[idx];
+        }
+    }
+    
+    best_idx
+}
+
+/// Finds the best solution in a population based on fitness values.
+/// 
+/// # Arguments
+/// * `population` - The population of solutions
+/// * `fitness_values` - The fitness value for each solution
+/// 
+/// # Returns
+/// * `&Solution` - Reference to the best solution
+fn find_best_solution<'a>(population: &'a [Solution], fitness_values: &[f64]) -> &'a Solution {
+    let best_idx = fitness_values.iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(idx, _)| idx)
+        .unwrap();
+    
+    &population[best_idx]
+}
+
+/// Combines two parent solutions to create a new child solution.
+/// Uses a segment-based crossover where some nurse routes are taken from each parent.
+/// 
+/// # Arguments
+/// * `parent1` - First parent solution
+/// * `parent2` - Second parent solution
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `Solution` - The new child solution
+fn crossover(parent1: &Solution, parent2: &Solution, problem: &Problem) -> Solution {
+    let num_nurses = parent1.len();
+    let mut child = vec![Vec::new(); num_nurses];
+    
+    // Select random crossover points
+    let crossover_point1 = rand::thread_rng().gen_range(0..num_nurses);
+    let crossover_point2 = rand::thread_rng().gen_range(0..num_nurses);
+    
+    let (start, end) = if crossover_point1 <= crossover_point2 {
+        (crossover_point1, crossover_point2)
+    } else {
+        (crossover_point2, crossover_point1)
+    };
+    
+    // Copy routes from parent1 outside the crossover points
+    for i in 0..start {
+        child[i] = parent1[i].clone();
+    }
+    
+    for i in end+1..num_nurses {
+        child[i] = parent1[i].clone();
+    }
+    
+    // Copy routes from parent2 within the crossover points
+    for i in start..=end {
+        child[i] = parent2[i].clone();
+    }
+    
+    // At this point, some patients may be missing or duplicated
+    // This will be fixed by the repair function
+    
+    child
+}
+
+/// Applies a random mutation to a solution.
+/// Uses several different mutation operators:
+/// 1. Swap two patients within a route
+/// 2. Move a patient from one route to another
+/// 3. Reverse a segment within a route
+/// 4. Exchange segments between routes
+/// 
+/// # Arguments
+/// * `solution` - The solution to mutate
+/// * `problem` - The problem instance
+/// 
+/// # Returns
+/// * `bool` - True if mutation was successful
+fn mutate(solution: &mut Solution, problem: &Problem) -> bool {
+    let num_nurses = solution.len();
+    let mut rng = rand::thread_rng();
+    
+    // Choose mutation type randomly
+    let mutation_type = rng.gen_range(0..4);
+    
+    match mutation_type {
+        0 => {
+            // Swap two patients within a route
+            let nurse_id = rng.gen_range(0..num_nurses);
+            let route = &mut solution[nurse_id];
+            
+            if route.len() < 2 {
+                return false; // Need at least 2 patients to swap
             }
             
-            // Migration logic...
-            if gen > 0 && gen % migration_interval == 0 {
-                println!("Performing migration at generation {}", gen);
-                for i in 0..num_islands {
-                    let to_island = (i + 1) % num_islands;
-                    perform_migration(&mut islands, i, to_island, migration_size, instance);
-                }
+            let idx1 = rng.gen_range(0..route.len());
+            let mut idx2 = rng.gen_range(0..route.len());
+            
+            while idx2 == idx1 {
+                idx2 = rng.gen_range(0..route.len());
             }
             
-            // Early stopping check...
-            if generations_without_improvement >= stagnation_generations {
-                println!("Early stopping due to {} generations without improvement", stagnation_generations);
-                should_stop.store(true, Ordering::Relaxed);
+            route.swap(idx1, idx2);
+            true
+        },
+        1 => {
+            // Move a patient from one route to another
+            if num_nurses < 2 {
+                return false;
+            }
+            
+            let from_nurse = rng.gen_range(0..num_nurses);
+            let mut to_nurse = rng.gen_range(0..num_nurses);
+            
+            while to_nurse == from_nurse {
+                to_nurse = rng.gen_range(0..num_nurses);
+            }
+            
+            if solution[from_nurse].is_empty() {
+                return false; // Can't move from empty route
+            }
+            
+            let from_idx = rng.gen_range(0..solution[from_nurse].len());
+            let patient_id = solution[from_nurse][from_idx];
+            
+            solution[from_nurse].remove(from_idx);
+            
+            let to_idx = if solution[to_nurse].is_empty() {
+                0
+            } else {
+                rng.gen_range(0..=solution[to_nurse].len())
+            };
+            
+            solution[to_nurse].insert(to_idx, patient_id);
+            true
+        },
+        2 => {
+            // Reverse a segment of a route (2-opt)
+            let nurse_id = rng.gen_range(0..num_nurses);
+            let route = &mut solution[nurse_id];
+            
+            if route.len() < 3 {
+                return false; // Need at least 3 patients for meaningful reversal
+            }
+            
+            let start = rng.gen_range(0..route.len()-1);
+            let end = rng.gen_range(start+1..route.len());
+            
+            route[start..=end].reverse();
+            true
+        },
+        3 => {
+            // Exchange segments between two routes
+            if num_nurses < 2 {
+                return false;
+            }
+            
+            let nurse1 = rng.gen_range(0..num_nurses);
+            let mut nurse2 = rng.gen_range(0..num_nurses);
+            
+            while nurse2 == nurse1 {
+                nurse2 = rng.gen_range(0..num_nurses);
+            }
+            
+            if solution[nurse1].is_empty() || solution[nurse2].is_empty() {
+                return false; // Both routes need patients
+            }
+            
+            let len1 = solution[nurse1].len();
+            let len2 = solution[nurse2].len();
+            
+            let start1 = rng.gen_range(0..len1);
+            let length1 = rng.gen_range(1..=len1 - start1);
+            
+            let start2 = rng.gen_range(0..len2);
+            let length2 = rng.gen_range(1..=len2 - start2);
+            
+            let segment1: Vec<usize> = solution[nurse1][start1..start1+length1].to_vec();
+            let segment2: Vec<usize> = solution[nurse2][start2..start2+length2].to_vec();
+            
+            // Remove segment2 and insert segment1
+            solution[nurse2].splice(start2..start2+length2, segment1);
+            
+            // Remove segment1 and insert segment2
+            solution[nurse1].splice(start1..start1+length1, segment2);
+            
+            true
+        },
+        _ => false,
+    }
+}
+
+/// Repairs a solution to ensure validity by:
+/// 1. Removing duplicate patients
+/// 2. Adding missing patients
+/// 3. Fixing capacity violations
+/// 4. Fixing time window violations
+/// 
+/// # Arguments
+/// * `solution` - The solution to repair
+/// * `problem` - The problem instance
+fn repair_solution(solution: &mut Solution, problem: &Problem) {
+    // First, collect all patients assigned to each route
+    let mut assigned_patients = HashSet::new();
+    
+    for route in solution.iter() {
+        for &patient_id in route {
+            assigned_patients.insert(patient_id);
+        }
+    }
+    
+    // Find patients that are assigned multiple times
+    let mut patient_count = HashMap::new();
+    
+    for route in solution.iter() {
+        for &patient_id in route {
+            *patient_count.entry(patient_id).or_insert(0) += 1;
+        }
+    }
+    
+    // Remove duplicate patients
+    for (nurse_id, route) in solution.iter_mut().enumerate() {
+        let mut i = 0;
+        
+        while i < route.len() {
+            let patient_id = route[i];
+            
+            if patient_count[&patient_id] > 1 {
+                route.remove(i);
+                *patient_count.get_mut(&patient_id).unwrap() -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    
+    // Find missing patients
+    let mut missing_patients = Vec::new();
+    
+    for patient_id in 1..=problem.patients.len() {
+        if !assigned_patients.contains(&patient_id) || patient_count.get(&patient_id).map_or(0, |&c| c) == 0 {
+            missing_patients.push(patient_id);
+        }
+    }
+    
+    // Assign missing patients
+    for &patient_id in &missing_patients {
+        let mut best_nurse = 0;
+        let mut best_position = 0;
+        let mut best_cost_increase = f64::INFINITY;
+        
+        // Try to insert in each position of each nurse's route
+        for nurse_id in 0..solution.len() {
+            let route = &solution[nurse_id];
+            
+            for pos in 0..=route.len() {
+                let mut new_route = route.clone();
+                new_route.insert(pos, patient_id);
+                
+                if is_valid_route(&new_route, nurse_id, problem) {
+                    let old_cost = calculate_route_travel_time(route, problem);
+                    let new_cost = calculate_route_travel_time(&new_route, problem);
+                    let cost_increase = new_cost - old_cost;
+                    
+                    if cost_increase < best_cost_increase {
+                        best_nurse = nurse_id;
+                        best_position = pos;
+                        best_cost_increase = cost_increase;
+                    }
+                }
             }
         }
         
-        (
-            best_solution_overall.unwrap(),
-            best_fitness_overall,
-            fitness_history,
+        // If we found a valid position, insert the patient
+        if best_cost_increase < f64::INFINITY {
+            solution[best_nurse].insert(best_position, patient_id);
+        } else {
+            // If no valid position found, create a new route for this patient
+            let nurse_id = rand::thread_rng().gen_range(0..solution.len());
+            solution[nurse_id] = vec![patient_id];
+        }
+    }
+    
+    // Fix capacity violations
+    for nurse_id in 0..solution.len() {
+        fix_capacity_violation(solution, nurse_id, problem);
+    }
+    
+    // Fix time window violations
+    for nurse_id in 0..solution.len() {
+        fix_time_window_violation(solution, nurse_id, problem);
+    }
+}
+
+/// Fixes capacity violations for a specific route by:
+/// 1. Identifying routes that exceed capacity
+/// 2. Removing patients with highest demand until capacity is met
+/// 3. Trying to reassign removed patients to other routes
+/// 
+/// # Arguments
+/// * `solution` - The solution to repair
+/// * `nurse_id` - The nurse route to check
+/// * `problem` - The problem instance
+fn fix_capacity_violation(solution: &mut Solution, nurse_id: usize, problem: &Problem) {
+    let route = &solution[nurse_id];
+    
+    // Calculate total demand
+    let total_demand: usize = route.iter()
+        .map(|&patient_id| problem.patients.get(&patient_id.to_string()).unwrap().demand)
+        .sum();
+    
+    if total_demand <= problem.capacity_nurse {
+        return; // No violation
+    }
+    
+    let mut route = route.clone();
+    
+    // Remove patients until the capacity constraint is satisfied
+    while route.iter()
+        .map(|&patient_id| problem.patients.get(&patient_id.to_string()).unwrap().demand)
+        .sum::<usize>() > problem.capacity_nurse
+    {
+        // Find the patient with the highest demand
+        let (idx, _) = route.iter().enumerate()
+            .max_by_key(|(_, &patient_id)| problem.patients.get(&patient_id.to_string()).unwrap().demand)
+            .unwrap();
+        
+        let removed_patient = route.remove(idx);
+        
+        // Try to insert this patient into another nurse's route
+        let mut inserted = false;
+        
+        for other_nurse_id in 0..solution.len() {
+            if other_nurse_id == nurse_id {
+                continue;
+            }
+            
+            let other_route = &solution[other_nurse_id];
+            
+            // Try each possible insertion position
+            for pos in 0..=other_route.len() {
+                let mut new_route = other_route.clone();
+                new_route.insert(pos, removed_patient);
+                
+                if is_valid_route(&new_route, other_nurse_id, problem) {
+                    solution[other_nurse_id] = new_route;
+                    inserted = true;
+                    break;
+                }
+            }
+            
+            if inserted {
+                break;
+            }
+        }
+        
+        // If not inserted, create a new nurse route
+        if !inserted {
+            for new_nurse_id in 0..solution.len() {
+                if solution[new_nurse_id].is_empty() {
+                    solution[new_nurse_id] = vec![removed_patient];
+                    inserted = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    solution[nurse_id] = route;
+}
+
+// =================== OUTPUT FUNCTIONS ===================
+
+/// Outputs detailed information about the solution, including:
+/// - Route assignments for each nurse
+/// - Timing details for patient visits
+/// - Travel time for each route
+/// - Total objective value
+/// 
+/// # Arguments
+/// * `solution` - The solution to output
+/// * `problem` - The problem instance
+fn output_solution(solution: &Solution, problem: &Problem) {
+    println!("\nDetailed Solution:");
+    println!("Nurse capacity: {}", problem.capacity_nurse);
+    println!("Depot return time: {}", problem.depot.return_time);
+    println!("{:-<80}", "");
+    
+    for (nurse_id, route) in solution.iter().enumerate() {
+        // Skip empty routes
+        if route.is_empty() {
+            continue;
+        }
+        
+        let route_travel_time = calculate_route_travel_time(route, problem);
+        let route_demand: usize = route.iter()
+            .map(|&patient_id| problem.patients.get(&patient_id.to_string()).unwrap().demand)
+            .sum();
+        
+        println!("Nurse {:<2} {:<12.2} {:<16} Patient sequence", 
+                 nurse_id + 1, route_travel_time, route_demand);
+        
+        // Calculate and output timing details for each patient
+        let mut current_time = 0.0;
+        let mut current_location = 0; // depot
+        
+        print!("         D (0)");
+        
+        for &patient_id in route {
+            // Travel to patient
+            current_time += problem.travel_times[current_location][patient_id];
+            current_location = patient_id;
+            
+            let patient = problem.patients.get(&patient_id.to_string()).unwrap();
+            
+            // Wait if arrived early
+            let arrival_time = current_time;
+            if current_time < patient.start_time as f64 {
+                current_time = patient.start_time as f64;
+            }
+            
+            // Start care
+            let care_start = current_time;
+            
+            // Complete care
+            current_time += patient.care_time as f64;
+            
+            print!(" -> {} ({:.2}-{:.2}) [{}-{}]", 
+                   patient_id, care_start, current_time, 
+                   patient.start_time, patient.end_time);
+        }
+        
+        // Return to depot
+        current_time += problem.travel_times[current_location][0];
+        println!(" -> D ({:.2})", current_time);
+    }
+    
+    println!("{:-<80}", "");
+    println!("Objective value (total travel time): {:.2}", evaluate_solution(solution, problem));
+}
+
+/// Generates plot data to visualize the solution.
+/// Creates a PNG file showing depot, patients, and routes.
+/// 
+/// # Arguments
+/// * `solution` - The solution to visualize
+/// * `problem` - The problem instance
+/// * `output_file` - Filename for the output PNG
+/// 
+/// # Returns
+/// * `Result<(), Box<dyn Error>>` - Success or error
+fn generate_plot_data(solution: &Solution, problem: &Problem, output_file: &str) -> Result<(), Box<dyn Error>> {
+    use plotters::prelude::*;
+    
+    // First, find the range of coordinates to set drawing area dimensions
+    let mut min_x = problem.depot.x_coord as i32;
+    let mut max_x = problem.depot.x_coord as i32;
+    let mut min_y = problem.depot.y_coord as i32;
+    let mut max_y = problem.depot.y_coord as i32;
+    
+    for patient in problem.patients.values() {
+        min_x = min_x.min(patient.x_coord as i32);
+        max_x = max_x.max(patient.x_coord as i32);
+        min_y = min_y.min(patient.y_coord as i32);
+        max_y = max_y.max(patient.y_coord as i32);
+    }
+    
+    // Add some padding
+    let padding = (max(max_x - min_x, max_y - min_y) / 10).max(5);
+    min_x -= padding;
+    max_x += padding;
+    min_y -= padding;
+    max_y += padding;
+    
+    // Create drawing area
+    let root_area = BitMapBackend::new(output_file, (1024, 768))
+        .into_drawing_area();
+    root_area.fill(&WHITE)?;
+    
+    // Create chart context
+    let mut chart = ChartBuilder::on(&root_area)
+        .margin(20)
+        .caption(format!("Solution for {}", problem.instance_name), ("sans-serif", 20).into_font())
+        .build_cartesian_2d(min_x..max_x, min_y..max_y)?;
+    
+    chart.configure_mesh()
+        .disable_x_mesh()
+        .disable_y_mesh()
+        .draw()?;
+    
+    // Define a set of colors for routes
+    let colors = vec![
+        &RED, &BLUE, &GREEN, &CYAN, &MAGENTA, &YELLOW, 
+        &BLACK, &RGBColor(255, 165, 0), &RGBColor(128, 0, 128), &RGBColor(165, 42, 42),
+        &RGBColor(0, 128, 128), &RGBColor(128, 128, 0), &RGBColor(220, 20, 60),
+        &RGBColor(0, 191, 255), &RGBColor(50, 205, 50), &RGBColor(255, 215, 0),
+        &RGBColor(75, 0, 130), &RGBColor(255, 20, 147), &RGBColor(0, 255, 127),
+        &RGBColor(255, 99, 71)
+    ];
+    
+    // Plot depot as a big square
+    chart.draw_series(std::iter::once(
+        Rectangle::new(
+            [(problem.depot.x_coord as i32 - 2, problem.depot.y_coord as i32 - 2), 
+             (problem.depot.x_coord as i32 + 2, problem.depot.y_coord as i32 + 2)],
+            BLACK.filled()
         )
+    ))?;
+    
+    // Plot patients as small squares with IDs
+    for (id_str, patient) in &problem.patients {
+        let id = id_str.parse::<usize>().unwrap_or(0);
+        chart.draw_series(std::iter::once(
+            Rectangle::new(
+                [(patient.x_coord as i32 - 1, patient.y_coord as i32 - 1), 
+                 (patient.x_coord as i32 + 1, patient.y_coord as i32 + 1)],
+                BLACK.filled()
+            )
+        ))?;
+        
+        // Add patient ID text
+        chart.draw_series(std::iter::once(
+            Text::new(
+                format!("{}", id),
+                (patient.x_coord as i32 + 2, patient.y_coord as i32 + 2),
+                ("sans-serif", 12).into_font()
+            )
+        ))?;
     }
     
-    /// OPTIMIZATION: Improved migration strategy
-    fn perform_migration(
-        islands: &mut Vec<Vec<Solution>>, 
-        from_island: usize, 
-        to_island: usize, 
-        migration_size: usize,
-        instance: &ProblemInstance
-    ) {
-        // Sort from_island by fitness (best first)
-        islands[from_island].sort_by(|a, b| {
-            ga::fitness(a, instance)
-                .partial_cmp(&ga::fitness(b, instance))
-                .unwrap()
-        });
+    // Plot routes
+    for (nurse_idx, route) in solution.iter().enumerate().filter(|(_, r)| !r.is_empty()) {
+        let color_idx = nurse_idx % colors.len();
+        let color = colors[color_idx];
         
-        // Select migrants (best solutions)
-        let migrants: Vec<Solution> = islands[from_island]
-            .iter()
-            .take(migration_size)
-            .cloned()
-            .collect();
+        // Create points for the route starting from depot
+        let mut route_points = Vec::new();
+        route_points.push((problem.depot.x_coord as i32, problem.depot.y_coord as i32));
         
-        // Sort to_island by fitness (worst first)
-        islands[to_island].sort_by(|a, b| {
-            ga::fitness(b, instance)
-                .partial_cmp(&ga::fitness(a, instance))
-                .unwrap()
-        });
-        
-        // Replace worst solutions with migrants
-        for j in 0..migration_size {
-            if j < islands[to_island].len() {
-                islands[to_island][j] = migrants[j].clone();
-            }
+        for &patient_id in route {
+            let patient = problem.patients.get(&patient_id.to_string()).unwrap();
+            route_points.push((patient.x_coord as i32, patient.y_coord as i32));
         }
+        
+        // Add return to depot
+        route_points.push((problem.depot.x_coord as i32, problem.depot.y_coord as i32));
+        
+        // Draw the route
+        chart.draw_series(LineSeries::new(
+            route_points,
+            color.clone().stroke_width(2)
+        ))?.label(format!("Nurse {}", nurse_idx + 1))
+         .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color.clone()));
     }
-}
-
-fn load_instance(filename: &str) -> Result<models::ProblemInstance, Box<dyn std::error::Error>> {
-    let file = File::open(filename)?;
-    let reader = BufReader::new(file);
-    let instance = serde_json::from_reader(reader)?;
-    Ok(instance)
-}
-
-fn main() {
-    // OPTIMIZATION: Improved parameter settings
-    let total_population = 2000;
-    let num_generations = 4000;
-    let initial_mutation_rate = 0.1;
-    let final_mutation_rate = 0.05;
-    let crossover_rate = 0.7;
-    let elitism_count = 4;
-    let tournament_size = 5;
-    let sigma_share = 20.0;
-    let alpha = 0.2;
     
-    // Island model parameters
-    let num_islands = 4;
-    let migration_interval = 400;
-    let migration_size = 5;
+    // Draw the legend
+    chart.configure_series_labels()
+        .background_style(WHITE.filled())
+        .border_style(BLACK)
+        .position(SeriesLabelPosition::UpperRight)
+        .draw()?;
     
-    // Memetic algorithm parameters
-    let memetic_rate = 0.15;  // Apply local search to 5% of population each generation
+    // Save the plot to file
+    root_area.present()?;
+    println!("Plot generated successfully: {}", output_file);
     
-    // Restart parameters
-    let stagnation_generations = 1000;
-    
-    // Optional time limit (e.g. 10 minutes)
-    let time_limit = None; //Some(std::time::Duration::from_secs(600));
-
-    let filename = "train/train_3.json";
-    match load_instance(filename) {
-        Ok(instance) => {
-            println!("Starting optimization for instance: {}", instance.instance_name);
-            println!("Benchmark value: {:.2}", instance.benchmark);
-            
-            let start_time = std::time::Instant::now();
-            
-            let (best_solution, best_fit, fitness_history) = island::run_island_model(
-                &instance,
-                num_islands,
-                total_population,
-                num_generations,
-                migration_interval,
-                migration_size,
-                initial_mutation_rate,
-                final_mutation_rate,
-                crossover_rate,
-                elitism_count,
-                tournament_size,
-                sigma_share,
-                alpha,
-                memetic_rate,
-                stagnation_generations,
-                time_limit,
-            );
-            
-            let elapsed = start_time.elapsed();
-            println!("\nOptimization completed in {:.2} seconds", elapsed.as_secs_f64());
-            
-            println!("\nBeste løsning funnet med raw fitness {:.2}:", best_fit);
-            println!("Benchmark: {:.2}", instance.benchmark);
-            let abs_diff = (best_fit - instance.benchmark).abs();
-            println!("Absolutt differanse fra benchmark: {:.2}", abs_diff);
-            let percent_diff = ((best_fit - instance.benchmark) / instance.benchmark) * 100.0;
-            println!("Relativ feil: {:.2}%", percent_diff);
-            
-            println!("\nStatistics for best solution:");
-            println!("Number of routes: {}", best_solution.routes.len());
-            println!("Required nurses: {}", instance.nbr_nurses);
-            
-            // Format solution for output
-            println!("\nDetailed solution:");
-            println!("Nurse capacity: {}", instance.capacity_nurse);
-            println!("Depot return time: {}", instance.depot.return_time);
-            println!("{}", "-".repeat(80));
-            
-            for (i, route) in best_solution.routes.iter().enumerate() {
-                let (_travel_time, duration) = models::simulate_route(route, &instance)
-                    .unwrap_or((0.0, 0.0));
-                    
-                let demand: f64 = route.iter()
-                    .map(|&pid| instance.patients.get(&pid.to_string()).unwrap().demand)
-                    .sum();
-                    
-                println!("Nurse {}: Route duration {:.2}, Covered demand {:.2}, Patients: {:?}",
-                    i+1, duration, demand, route);
-            }
-            println!("{}", "-".repeat(80));
-            println!("Total travel time: {:.2}", best_fit);
-
-            if let Err(e) = plotting::plot_solution(&instance, &best_solution) {
-                println!("Feil under plotting av løsning: {}", e);
-            }
-            if let Err(e) = plotting::plot_fitness_history(&fitness_history) {
-                println!("Feil under plotting av fitnesshistorikk: {}", e);
-            }
-        }
-        Err(e) => println!("Feil ved lasting av instans: {}", e),
-    }
+    Ok(())
 }

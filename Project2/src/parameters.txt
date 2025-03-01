@@ -1,0 +1,8 @@
+Standard:
+Mutation_rate = 0.2         // 0.2 seems like a sweet spot
+Mutation_rate_after = 0.8   // 08 worked well
+
+Population_size = 4000      // Good results on test data, but could try to up it.
+Generations = ~5000         // Change if it stagnates early, but doesn´t matter because of ctr + c
+Max_no_improvement = 250    // Good as is, but can adjust
+Max_iterations = 100        // Keep the same
