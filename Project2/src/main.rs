@@ -68,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     
     // Hardcoded problem file (would typically be passed as an argument)
-    let problem_file = "train/train_2.json";
+    let problem_file = "test2/test_2.json";
     
     // Set GA parameters
     let generations = 5000;      // Number of generations to evolve
@@ -1533,8 +1533,8 @@ fn output_solution(solution: &Solution, problem: &Problem) {
     println!("Objective value (total travel time): {:.2}", evaluate_solution(solution, problem));
 }
 
-/// Generates plot data to visualize the solution.
-/// Creates a PNG file showing depot, patients, and routes.
+/// Generates an improved plot to visualize the solution.
+/// Creates a PNG file showing depot, patients, and routes with better aesthetics.
 /// 
 /// # Arguments
 /// * `solution` - The solution to visualize
@@ -1566,63 +1566,52 @@ fn generate_plot_data(solution: &Solution, problem: &Problem, output_file: &str)
     min_y -= padding;
     max_y += padding;
     
-    // Create drawing area
-    let root_area = BitMapBackend::new(output_file, (1024, 768))
+    // Create drawing area with a white background
+    let root_area = BitMapBackend::new(output_file, (1200, 900))
         .into_drawing_area();
     root_area.fill(&WHITE)?;
     
-    // Create chart context
+    // Create chart context with a title that includes the instance name
     let mut chart = ChartBuilder::on(&root_area)
-        .margin(20)
-        .caption(format!("Solution for {}", problem.instance_name), ("sans-serif", 20).into_font())
+        .margin(40)
+        .caption(format!("Solution for {}", problem.instance_name), ("sans-serif", 24).into_font())
         .build_cartesian_2d(min_x..max_x, min_y..max_y)?;
     
+    // Configure a clean mesh with light grid lines
     chart.configure_mesh()
-        .disable_x_mesh()
-        .disable_y_mesh()
+        .x_labels(10)
+        .y_labels(10)
+        .x_desc("X Coordinate")
+        .y_desc("Y Coordinate")
+        .axis_desc_style(("sans-serif", 16))
+        .light_line_style(&RGBColor(200, 200, 200))
         .draw()?;
     
-    // Define a set of colors for routes
+    // Define a set of distinct colors for routes with better visibility
     let colors = vec![
-        &RED, &BLUE, &GREEN, &CYAN, &MAGENTA, &YELLOW, 
-        &BLACK, &RGBColor(255, 165, 0), &RGBColor(128, 0, 128), &RGBColor(165, 42, 42),
-        &RGBColor(0, 128, 128), &RGBColor(128, 128, 0), &RGBColor(220, 20, 60),
-        &RGBColor(0, 191, 255), &RGBColor(50, 205, 50), &RGBColor(255, 215, 0),
-        &RGBColor(75, 0, 130), &RGBColor(255, 20, 147), &RGBColor(0, 255, 127),
-        &RGBColor(255, 99, 71)
+        &RGBColor(220, 20, 60),   // Crimson
+        &RGBColor(0, 128, 0),     // Green
+        &RGBColor(0, 0, 205),     // MediumBlue
+        &RGBColor(255, 140, 0),   // DarkOrange
+        &RGBColor(148, 0, 211),   // DarkViolet
+        &RGBColor(0, 139, 139),   // DarkCyan
+        &RGBColor(184, 134, 11),  // DarkGoldenrod
+        &RGBColor(178, 34, 34),   // Firebrick
+        &RGBColor(85, 107, 47),   // DarkOliveGreen
+        &RGBColor(70, 130, 180),  // SteelBlue
+        &RGBColor(153, 50, 204),  // DarkOrchid
+        &RGBColor(46, 139, 87),   // SeaGreen
+        &RGBColor(205, 92, 92),   // IndianRed
+        &RGBColor(60, 179, 113),  // MediumSeaGreen
+        &RGBColor(123, 104, 238), // MediumSlateBlue
+        &RGBColor(255, 99, 71),   // Tomato
+        &RGBColor(0, 191, 255),   // DeepSkyBlue
+        &RGBColor(50, 205, 50),   // LimeGreen
+        &RGBColor(255, 215, 0),   // Gold
+        &RGBColor(255, 20, 147),  // DeepPink
     ];
     
-    // Plot depot as a big square
-    chart.draw_series(std::iter::once(
-        Rectangle::new(
-            [(problem.depot.x_coord as i32 - 2, problem.depot.y_coord as i32 - 2), 
-             (problem.depot.x_coord as i32 + 2, problem.depot.y_coord as i32 + 2)],
-            BLACK.filled()
-        )
-    ))?;
-    
-    // Plot patients as small squares with IDs
-    for (id_str, patient) in &problem.patients {
-        let id = id_str.parse::<usize>().unwrap_or(0);
-        chart.draw_series(std::iter::once(
-            Rectangle::new(
-                [(patient.x_coord as i32 - 1, patient.y_coord as i32 - 1), 
-                 (patient.x_coord as i32 + 1, patient.y_coord as i32 + 1)],
-                BLACK.filled()
-            )
-        ))?;
-        
-        // Add patient ID text
-        chart.draw_series(std::iter::once(
-            Text::new(
-                format!("{}", id),
-                (patient.x_coord as i32 + 2, patient.y_coord as i32 + 2),
-                ("sans-serif", 12).into_font()
-            )
-        ))?;
-    }
-    
-    // Plot routes
+    // Plot routes first (under the points)
     for (nurse_idx, route) in solution.iter().enumerate().filter(|(_, r)| !r.is_empty()) {
         let color_idx = nurse_idx % colors.len();
         let color = colors[color_idx];
@@ -1639,20 +1628,76 @@ fn generate_plot_data(solution: &Solution, problem: &Problem, output_file: &str)
         // Add return to depot
         route_points.push((problem.depot.x_coord as i32, problem.depot.y_coord as i32));
         
-        // Draw the route
+        // Draw the route with thicker lines
         chart.draw_series(LineSeries::new(
             route_points,
-            color.clone().stroke_width(2)
+            color.clone().stroke_width(3)
         ))?.label(format!("Nurse {}", nurse_idx + 1))
-         .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color.clone()));
+         .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color.clone().stroke_width(3)));
     }
     
-    // Draw the legend
+    // Plot depot as a distinctive star or diamond
+    chart.draw_series(std::iter::once(
+        EmptyElement::at((problem.depot.x_coord as i32, problem.depot.y_coord as i32))
+            + Circle::new((0, 0), 6, RGBColor(50, 50, 50).filled())
+            + Circle::new((0, 0), 4, WHITE.filled())
+            + Text::new(
+                "Depot",
+                (5, 5),
+                ("sans-serif", 14).into_font().color(&RGBColor(50, 50, 50))
+            )
+    ))?;
+    
+    // Plot patients as smaller points with IDs
+    for (id_str, patient) in &problem.patients {
+        let id = id_str.parse::<usize>().unwrap_or(0);
+        
+        // Determine if this patient is part of any route
+        let is_assigned = solution.iter().any(|route| route.contains(&id));
+        
+        // Use different styling for assigned vs unassigned patients
+        let point_style = if is_assigned {
+            ShapeStyle::from(&BLACK).filled()
+        } else {
+            ShapeStyle::from(&RGBColor(150, 150, 150)).filled()
+        };
+        
+        // Draw slightly larger patient circles without ID numbers
+        chart.draw_series(std::iter::once(
+            EmptyElement::at((patient.x_coord as i32, patient.y_coord as i32))
+                + Circle::new((0, 0), 3, point_style)
+        ))?;
+    }
+    
+    // Draw the legend with improved styling
     chart.configure_series_labels()
-        .background_style(WHITE.filled())
+        .background_style(WHITE.mix(0.8).filled())
         .border_style(BLACK)
+        .margin(10)
         .position(SeriesLabelPosition::UpperRight)
+        .legend_area_size(22) // Increase legend spacing
         .draw()?;
+    
+    // Add solution quality information
+    let total_travel_time = evaluate_solution(solution, problem);
+    let gap = ((total_travel_time - problem.benchmark) / problem.benchmark) * 100.0;
+    
+    let quality_text = format!(
+        "Travel time: {:.2} | Benchmark: {:.2} | Gap: {:.2}%", 
+        total_travel_time, 
+        problem.benchmark, 
+        gap
+    );
+    
+    // Draw solution summary at the bottom
+    let style = TextStyle::from(("sans-serif", 16).into_font())
+        .color(&BLACK);
+    
+    root_area.draw_text(
+        &quality_text,
+        &style,
+        (120, 40),
+    )?;
     
     // Save the plot to file
     root_area.present()?;
